@@ -1,4 +1,5 @@
 const std = @import("std");
+const posix = std.posix;
 const trigram_mod = @import("trigram.zig");
 const reader_mod = @import("reader.zig");
 const Trigram = trigram_mod.Trigram;
@@ -56,25 +57,51 @@ pub const Searcher = struct {
         const ranked = try self.intersectAndRank(posting_lists.items);
         defer self.allocator.free(ranked);
 
-        const result_count = @min(max_results, ranked.len);
-        var results = try self.allocator.alloc(SearchResult, result_count);
-        errdefer self.allocator.free(results);
+        var results = std.ArrayList(SearchResult).init(self.allocator);
+        errdefer results.deinit();
 
-        for (0..result_count) |i| {
-            results[i] = .{
-                .file_id = ranked[i].file_id,
-                .match_count = ranked[i].count,
-                .name = self.reader.getName(ranked[i].file_id) orelse "",
-            };
+        for (ranked) |candidate| {
+            if (results.items.len >= max_results) break;
+
+            const name = self.reader.getName(candidate.file_id) orelse continue;
+            if (self.verifyMatch(name, query)) {
+                try results.append(.{
+                    .file_id = candidate.file_id,
+                    .match_count = candidate.count,
+                    .name = name,
+                });
+            }
         }
 
-        return results;
+        return results.toOwnedSlice();
     }
 
     const FileCount = struct {
         file_id: u32,
         count: u32,
     };
+
+    fn verifyMatch(self: *Searcher, path: []const u8, query: []const u8) bool {
+        _ = self;
+        const file = std.fs.cwd().openFile(path, .{}) catch return false;
+        defer file.close();
+
+        const stat = file.stat() catch return false;
+        const size = stat.size;
+        if (size == 0) return false;
+
+        const data = posix.mmap(
+            null,
+            size,
+            posix.PROT.READ,
+            .{ .TYPE = .SHARED },
+            file.handle,
+            0,
+        ) catch return false;
+        defer posix.munmap(data);
+
+        return std.mem.indexOf(u8, data, query) != null;
+    }
 
     fn intersectAndRank(self: *Searcher, lists: [][]u32) ![]FileCount {
         var counts = std.AutoHashMap(u32, u32).init(self.allocator);
@@ -120,15 +147,31 @@ pub const Searcher = struct {
 test "searcher basic" {
     const allocator = std.testing.allocator;
     const test_path = "/tmp/hound_search_test.idx";
+    const test_dir = "/tmp/hound_search_files";
     const index = @import("index.zig");
+
+    std.fs.cwd().deleteTree(test_dir) catch {};
+    try std.fs.cwd().makePath(test_dir);
+
+    const files = .{
+        .{ "hello.txt", "hello world" },
+        .{ "world.txt", "world peace" },
+        .{ "helloworld.txt", "hello world peace" },
+    };
+
+    inline for (files) |f| {
+        const file = try std.fs.cwd().createFile(test_dir ++ "/" ++ f[0], .{});
+        defer file.close();
+        try file.writeAll(f[1]);
+    }
 
     {
         var writer = try index.IndexWriter.init(allocator, test_path);
         defer writer.deinit();
 
-        try writer.addFile("hello.txt", "hello world");
-        try writer.addFile("world.txt", "world peace");
-        try writer.addFile("helloworld.txt", "hello world peace");
+        inline for (files) |f| {
+            try writer.addFile(test_dir ++ "/" ++ f[0], f[1]);
+        }
         try writer.finish();
     }
 
@@ -151,15 +194,31 @@ test "searcher basic" {
 test "searcher ranking" {
     const allocator = std.testing.allocator;
     const test_path = "/tmp/hound_search_rank_test.idx";
+    const test_dir = "/tmp/hound_search_rank_files";
     const index = @import("index.zig");
+
+    std.fs.cwd().deleteTree(test_dir) catch {};
+    try std.fs.cwd().makePath(test_dir);
+
+    const files = .{
+        .{ "partial.txt", "hello" },
+        .{ "full.txt", "hello world" },
+        .{ "none.txt", "goodbye" },
+    };
+
+    inline for (files) |f| {
+        const file = try std.fs.cwd().createFile(test_dir ++ "/" ++ f[0], .{});
+        defer file.close();
+        try file.writeAll(f[1]);
+    }
 
     {
         var writer = try index.IndexWriter.init(allocator, test_path);
         defer writer.deinit();
 
-        try writer.addFile("partial.txt", "hello");
-        try writer.addFile("full.txt", "hello world");
-        try writer.addFile("none.txt", "goodbye");
+        inline for (files) |f| {
+            try writer.addFile(test_dir ++ "/" ++ f[0], f[1]);
+        }
         try writer.finish();
     }
 
@@ -172,20 +231,30 @@ test "searcher ranking" {
     const results = try searcher.search("hello world", 10);
     defer searcher.freeResults(results);
 
-    try std.testing.expect(results.len >= 2);
-    try std.testing.expect(results[0].match_count >= results[results.len - 1].match_count);
+    try std.testing.expectEqual(@as(usize, 1), results.len);
+    try std.testing.expect(std.mem.indexOf(u8, results[0].name, "full.txt") != null);
 }
 
 test "searcher empty query" {
     const allocator = std.testing.allocator;
     const test_path = "/tmp/hound_search_empty_test.idx";
+    const test_dir = "/tmp/hound_search_empty_files";
     const index = @import("index.zig");
+
+    std.fs.cwd().deleteTree(test_dir) catch {};
+    try std.fs.cwd().makePath(test_dir);
+
+    {
+        const file = try std.fs.cwd().createFile(test_dir ++ "/test.txt", .{});
+        defer file.close();
+        try file.writeAll("hello");
+    }
 
     {
         var writer = try index.IndexWriter.init(allocator, test_path);
         defer writer.deinit();
 
-        try writer.addFile("test.txt", "hello");
+        try writer.addFile(test_dir ++ "/test.txt", "hello");
         try writer.finish();
     }
 
@@ -204,13 +273,23 @@ test "searcher empty query" {
 test "searcher no matches" {
     const allocator = std.testing.allocator;
     const test_path = "/tmp/hound_search_nomatch_test.idx";
+    const test_dir = "/tmp/hound_search_nomatch_files";
     const index = @import("index.zig");
+
+    std.fs.cwd().deleteTree(test_dir) catch {};
+    try std.fs.cwd().makePath(test_dir);
+
+    {
+        const file = try std.fs.cwd().createFile(test_dir ++ "/test.txt", .{});
+        defer file.close();
+        try file.writeAll("hello world");
+    }
 
     {
         var writer = try index.IndexWriter.init(allocator, test_path);
         defer writer.deinit();
 
-        try writer.addFile("test.txt", "hello world");
+        try writer.addFile(test_dir ++ "/test.txt", "hello world");
         try writer.finish();
     }
 
@@ -224,4 +303,46 @@ test "searcher no matches" {
     defer searcher.freeResults(results);
 
     try std.testing.expectEqual(@as(usize, 0), results.len);
+}
+
+test "content verification filters false positives" {
+    const allocator = std.testing.allocator;
+    const test_path = "/tmp/hound_verify_test.idx";
+    const test_dir = "/tmp/hound_verify_files";
+    const index = @import("index.zig");
+
+    std.fs.cwd().deleteTree(test_dir) catch {};
+    try std.fs.cwd().makePath(test_dir);
+
+    {
+        const file = try std.fs.cwd().createFile(test_dir ++ "/abc_def.txt", .{});
+        defer file.close();
+        try file.writeAll("abc def ghi");
+    }
+    {
+        const file = try std.fs.cwd().createFile(test_dir ++ "/abcdef.txt", .{});
+        defer file.close();
+        try file.writeAll("abcdef");
+    }
+
+    {
+        var writer = try index.IndexWriter.init(allocator, test_path);
+        defer writer.deinit();
+
+        try writer.addFile(test_dir ++ "/abc_def.txt", "abc def ghi");
+        try writer.addFile(test_dir ++ "/abcdef.txt", "abcdef");
+        try writer.finish();
+    }
+
+    var reader_inst = try IndexReader.open(allocator, test_path);
+    defer reader_inst.close();
+
+    var searcher = try Searcher.init(allocator, &reader_inst);
+    defer searcher.deinit();
+
+    const results = try searcher.search("abcdef", 10);
+    defer searcher.freeResults(results);
+
+    try std.testing.expectEqual(@as(usize, 1), results.len);
+    try std.testing.expect(std.mem.indexOf(u8, results[0].name, "abcdef.txt") != null);
 }
