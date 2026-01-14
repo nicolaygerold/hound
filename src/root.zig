@@ -9,6 +9,7 @@ pub const search = @import("search.zig");
 pub const watcher = @import("watcher.zig");
 pub const state = @import("state.zig");
 pub const incremental = @import("incremental.zig");
+pub const paths = @import("paths.zig");
 
 test {
     std.testing.refAllDecls(@This());
