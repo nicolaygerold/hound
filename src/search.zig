@@ -32,6 +32,33 @@ pub const SearchOptions = struct {
     max_results: usize = 100,
     context_lines: u32 = 2,
     max_snippets_per_file: u32 = 10,
+    thread_count: u32 = 0,
+};
+
+const VerifyTask = struct {
+    file_id: u32,
+    name: []const u8,
+    result: ?SearchResult,
+};
+
+const WorkerContext = struct {
+    tasks: []VerifyTask,
+    start_idx: usize,
+    end_idx: usize,
+    query: []const u8,
+    context_lines: u32,
+    max_snippets_per_file: u32,
+    allocator: std.mem.Allocator,
+};
+
+const RegexWorkerContext = struct {
+    tasks: []VerifyTask,
+    start_idx: usize,
+    end_idx: usize,
+    pattern: []const u8,
+    context_lines: u32,
+    max_snippets_per_file: u32,
+    allocator: std.mem.Allocator,
 };
 
 pub const Searcher = struct {
@@ -40,6 +67,7 @@ pub const Searcher = struct {
     allocator: std.mem.Allocator,
     context_lines: u32,
     max_snippets_per_file: u32,
+    thread_count: u32,
 
     pub fn init(allocator: std.mem.Allocator, reader: *IndexReader) !Searcher {
         return initWithOptions(allocator, reader, .{});
@@ -47,12 +75,15 @@ pub const Searcher = struct {
 
     pub fn initWithOptions(allocator: std.mem.Allocator, reader: *IndexReader, options: SearchOptions) !Searcher {
         _ = options.max_results;
+        const cpu_count = std.Thread.getCpuCount() catch 4;
+        const thread_count = if (options.thread_count == 0) @as(u32, @intCast(@min(cpu_count, 16))) else options.thread_count;
         return .{
             .reader = reader,
             .extractor = try Extractor.init(allocator),
             .allocator = allocator,
             .context_lines = options.context_lines,
             .max_snippets_per_file = options.max_snippets_per_file,
+            .thread_count = thread_count,
         };
     }
 
@@ -87,24 +118,122 @@ pub const Searcher = struct {
         const ranked = try self.intersectAndRank(posting_lists.items);
         defer self.allocator.free(ranked);
 
+        return self.verifyFilesParallel(ranked, query, max_results);
+    }
+
+    fn verifyFilesParallel(self: *Searcher, candidates: []const FileCount, query: []const u8, max_results: usize) ![]SearchResult {
+        const num_candidates = @min(candidates.len, max_results * 2);
+        if (num_candidates == 0) return &[_]SearchResult{};
+
+        var tasks = try self.allocator.alloc(VerifyTask, num_candidates);
+        defer self.allocator.free(tasks);
+
+        for (candidates[0..num_candidates], 0..) |candidate, i| {
+            tasks[i] = .{
+                .file_id = candidate.file_id,
+                .name = self.reader.getName(candidate.file_id) orelse "",
+                .result = null,
+            };
+        }
+
+        const effective_threads = @min(self.thread_count, @as(u32, @intCast(num_candidates)));
+
+        if (effective_threads <= 1 or num_candidates < 4) {
+            for (tasks) |*task| {
+                if (task.name.len > 0) {
+                    if (extractSnippetsStatic(task.name, query, self.context_lines, self.max_snippets_per_file, self.allocator)) |snippets| {
+                        task.result = .{
+                            .file_id = task.file_id,
+                            .match_count = @intCast(snippets.len),
+                            .name = task.name,
+                            .snippets = snippets,
+                        };
+                    }
+                }
+            }
+        } else {
+            var threads = try self.allocator.alloc(std.Thread, effective_threads);
+            defer self.allocator.free(threads);
+
+            const tasks_per_thread = (num_candidates + effective_threads - 1) / effective_threads;
+
+            for (0..effective_threads) |i| {
+                const start = i * tasks_per_thread;
+                const end = @min(start + tasks_per_thread, num_candidates);
+                if (start >= end) {
+                    threads[i] = try std.Thread.spawn(.{}, workerFn, .{WorkerContext{
+                        .tasks = tasks,
+                        .start_idx = 0,
+                        .end_idx = 0,
+                        .query = query,
+                        .context_lines = self.context_lines,
+                        .max_snippets_per_file = self.max_snippets_per_file,
+                        .allocator = self.allocator,
+                    }});
+                } else {
+                    threads[i] = try std.Thread.spawn(.{}, workerFn, .{WorkerContext{
+                        .tasks = tasks,
+                        .start_idx = start,
+                        .end_idx = end,
+                        .query = query,
+                        .context_lines = self.context_lines,
+                        .max_snippets_per_file = self.max_snippets_per_file,
+                        .allocator = self.allocator,
+                    }});
+                }
+            }
+
+            for (threads) |thread| {
+                thread.join();
+            }
+        }
+
         var results = std.ArrayList(SearchResult).init(self.allocator);
         errdefer results.deinit();
 
-        for (ranked) |candidate| {
+        for (tasks) |task| {
             if (results.items.len >= max_results) break;
-
-            const name = self.reader.getName(candidate.file_id) orelse continue;
-            if (self.extractSnippets(name, query)) |snippets| {
-                try results.append(.{
-                    .file_id = candidate.file_id,
-                    .match_count = @intCast(snippets.len),
-                    .name = name,
-                    .snippets = snippets,
-                });
+            if (task.result) |result| {
+                try results.append(result);
             }
         }
 
         return results.toOwnedSlice();
+    }
+
+    fn workerFn(ctx: WorkerContext) void {
+        for (ctx.start_idx..ctx.end_idx) |i| {
+            const task = &ctx.tasks[i];
+            if (task.name.len > 0) {
+                if (extractSnippetsStatic(task.name, ctx.query, ctx.context_lines, ctx.max_snippets_per_file, ctx.allocator)) |snippets| {
+                    task.result = .{
+                        .file_id = task.file_id,
+                        .match_count = @intCast(snippets.len),
+                        .name = task.name,
+                        .snippets = snippets,
+                    };
+                }
+            }
+        }
+    }
+
+    fn regexWorkerFn(ctx: RegexWorkerContext) void {
+        var regex = PosixRegex.compile(ctx.pattern, ctx.allocator) catch return;
+        defer regex.deinit();
+
+        for (ctx.start_idx..ctx.end_idx) |i| {
+            const task = &ctx.tasks[i];
+            if (task.name.len > 0) {
+                if (extractRegexSnippetsStatic(task.name, &regex, ctx.context_lines, ctx.max_snippets_per_file, ctx.allocator)) |snippets| {
+                    task.result = .{
+                        .file_id = task.file_id,
+                        .match_count = @intCast(snippets.len),
+                        .name = task.name,
+                        .snippets = snippets,
+                    };
+                }
+            }
+        }
     }
 
     const FileCount = struct {
@@ -303,21 +432,15 @@ pub const Searcher = struct {
     /// Search using a regex pattern
     /// Extracts required trigrams from regex to filter candidates, then verifies with full regex match
     pub fn searchRegex(self: *Searcher, pattern: []const u8, max_results: usize) ![]SearchResult {
-        // Step 1: Extract trigrams from regex pattern
         const trigrams = try regex_mod.extractTrigrams(self.allocator, pattern);
         defer self.allocator.free(trigrams);
 
-        // Step 2: Compile the regex for verification
-        var regex = PosixRegex.compile(pattern, self.allocator) catch return &[_]SearchResult{};
-        defer regex.deinit();
-
-        // Step 3: If no trigrams extracted, we must scan all files (expensive)
-        // For now, return empty if no trigrams - could add full scan option later
         if (trigrams.len == 0) {
+            var regex = PosixRegex.compile(pattern, self.allocator) catch return &[_]SearchResult{};
+            defer regex.deinit();
             return self.searchRegexFullScan(&regex, max_results);
         }
 
-        // Step 4: Look up posting lists for each trigram
         var posting_lists = std.ArrayList([]u32).init(self.allocator);
         defer {
             for (posting_lists.items) |list| self.allocator.free(list);
@@ -334,25 +457,89 @@ pub const Searcher = struct {
 
         if (posting_lists.items.len == 0) return &[_]SearchResult{};
 
-        // Step 5: Intersect and rank candidates
         const ranked = try self.intersectAndRank(posting_lists.items);
         defer self.allocator.free(ranked);
 
-        // Step 6: Verify with full regex and extract snippets
+        return self.verifyFilesParallelRegex(ranked, pattern, max_results);
+    }
+
+    fn verifyFilesParallelRegex(self: *Searcher, candidates: []const FileCount, pattern: []const u8, max_results: usize) ![]SearchResult {
+        const num_candidates = @min(candidates.len, max_results * 2);
+        if (num_candidates == 0) return &[_]SearchResult{};
+
+        var tasks = try self.allocator.alloc(VerifyTask, num_candidates);
+        defer self.allocator.free(tasks);
+
+        for (candidates[0..num_candidates], 0..) |candidate, i| {
+            tasks[i] = .{
+                .file_id = candidate.file_id,
+                .name = self.reader.getName(candidate.file_id) orelse "",
+                .result = null,
+            };
+        }
+
+        const effective_threads = @min(self.thread_count, @as(u32, @intCast(num_candidates)));
+
+        if (effective_threads <= 1 or num_candidates < 4) {
+            var regex = PosixRegex.compile(pattern, self.allocator) catch return &[_]SearchResult{};
+            defer regex.deinit();
+
+            for (tasks) |*task| {
+                if (task.name.len > 0) {
+                    if (extractRegexSnippetsStatic(task.name, &regex, self.context_lines, self.max_snippets_per_file, self.allocator)) |snippets| {
+                        task.result = .{
+                            .file_id = task.file_id,
+                            .match_count = @intCast(snippets.len),
+                            .name = task.name,
+                            .snippets = snippets,
+                        };
+                    }
+                }
+            }
+        } else {
+            var threads = try self.allocator.alloc(std.Thread, effective_threads);
+            defer self.allocator.free(threads);
+
+            const tasks_per_thread = (num_candidates + effective_threads - 1) / effective_threads;
+
+            for (0..effective_threads) |i| {
+                const start = i * tasks_per_thread;
+                const end = @min(start + tasks_per_thread, num_candidates);
+                if (start >= end) {
+                    threads[i] = try std.Thread.spawn(.{}, regexWorkerFn, .{RegexWorkerContext{
+                        .tasks = tasks,
+                        .start_idx = 0,
+                        .end_idx = 0,
+                        .pattern = pattern,
+                        .context_lines = self.context_lines,
+                        .max_snippets_per_file = self.max_snippets_per_file,
+                        .allocator = self.allocator,
+                    }});
+                } else {
+                    threads[i] = try std.Thread.spawn(.{}, regexWorkerFn, .{RegexWorkerContext{
+                        .tasks = tasks,
+                        .start_idx = start,
+                        .end_idx = end,
+                        .pattern = pattern,
+                        .context_lines = self.context_lines,
+                        .max_snippets_per_file = self.max_snippets_per_file,
+                        .allocator = self.allocator,
+                    }});
+                }
+            }
+
+            for (threads) |thread| {
+                thread.join();
+            }
+        }
+
         var results = std.ArrayList(SearchResult).init(self.allocator);
         errdefer results.deinit();
 
-        for (ranked) |candidate| {
+        for (tasks) |task| {
             if (results.items.len >= max_results) break;
-
-            const name = self.reader.getName(candidate.file_id) orelse continue;
-            if (self.extractRegexSnippets(name, &regex)) |snippets| {
-                try results.append(.{
-                    .file_id = candidate.file_id,
-                    .match_count = @intCast(snippets.len),
-                    .name = name,
-                    .snippets = snippets,
-                });
+            if (task.result) |result| {
+                try results.append(result);
             }
         }
 
@@ -506,6 +693,262 @@ pub const Searcher = struct {
         return snippets[0..snippet_count];
     }
 };
+
+fn extractSnippetsStatic(path: []const u8, query: []const u8, context_lines: u32, max_snippets_per_file: u32, allocator: std.mem.Allocator) ?[]ContextSnippet {
+    const file = std.fs.cwd().openFile(path, .{}) catch return null;
+    defer file.close();
+
+    const stat = file.stat() catch return null;
+    const size = stat.size;
+    if (size == 0) return null;
+
+    const data = posix.mmap(
+        null,
+        size,
+        posix.PROT.READ,
+        .{ .TYPE = .SHARED },
+        file.handle,
+        0,
+    ) catch return null;
+    defer posix.munmap(data);
+
+    var line_starts = std.ArrayList(usize).init(allocator);
+    defer line_starts.deinit();
+    line_starts.append(0) catch return null;
+
+    for (data, 0..) |byte, i| {
+        if (byte == '\n' and i + 1 < data.len) {
+            line_starts.append(i + 1) catch return null;
+        }
+    }
+
+    var match_lines = std.AutoHashMap(u32, std.ArrayList(MatchPosition)).init(allocator);
+    defer {
+        var it = match_lines.valueIterator();
+        while (it.next()) |list| list.deinit();
+        match_lines.deinit();
+    }
+
+    var search_start: usize = 0;
+    while (search_start < data.len) {
+        if (std.mem.indexOf(u8, data[search_start..], query)) |rel_pos| {
+            const match_start = search_start + rel_pos;
+            const match_end = match_start + query.len;
+            const line_num = findLineNumberStatic(line_starts.items, match_start);
+            const line_start = line_starts.items[line_num];
+            const match_in_line = MatchPosition{
+                .start = match_start - line_start,
+                .end = match_end - line_start,
+            };
+
+            const entry = match_lines.getOrPut(line_num) catch return null;
+            if (!entry.found_existing) {
+                entry.value_ptr.* = std.ArrayList(MatchPosition).init(allocator);
+            }
+            entry.value_ptr.append(match_in_line) catch return null;
+
+            search_start = match_start + 1;
+        } else {
+            break;
+        }
+    }
+
+    if (match_lines.count() == 0) return null;
+
+    var lines_to_include = std.AutoHashMap(u32, void).init(allocator);
+    defer lines_to_include.deinit();
+
+    var match_it = match_lines.keyIterator();
+    while (match_it.next()) |line_num_ptr| {
+        const line_num = line_num_ptr.*;
+        const start_line: u32 = if (line_num >= context_lines) line_num - context_lines else 0;
+        const total_lines: u32 = @intCast(line_starts.items.len);
+        const end_line = @min(line_num + context_lines, total_lines - 1);
+
+        var l = start_line;
+        while (l <= end_line) : (l += 1) {
+            lines_to_include.put(l, {}) catch return null;
+        }
+    }
+
+    var sorted_lines = std.ArrayList(u32).init(allocator);
+    defer sorted_lines.deinit();
+    var lines_it = lines_to_include.keyIterator();
+    while (lines_it.next()) |k| {
+        sorted_lines.append(k.*) catch return null;
+    }
+    std.mem.sort(u32, sorted_lines.items, {}, std.sort.asc(u32));
+
+    const max_snippets = @min(sorted_lines.items.len, max_snippets_per_file);
+    var snippets = allocator.alloc(ContextSnippet, max_snippets) catch return null;
+    errdefer allocator.free(snippets);
+
+    var snippet_count: usize = 0;
+    for (sorted_lines.items) |line_num| {
+        if (snippet_count >= max_snippets) break;
+
+        const line_start = line_starts.items[line_num];
+        const line_end = if (line_num + 1 < line_starts.items.len)
+            line_starts.items[line_num + 1] - 1
+        else
+            data.len;
+
+        const line_len = line_end - line_start;
+        const line_content = allocator.alloc(u8, line_len) catch return null;
+        @memcpy(line_content, data[line_start..line_end]);
+
+        var matches: []MatchPosition = &[_]MatchPosition{};
+        if (match_lines.get(line_num)) |match_list| {
+            matches = allocator.alloc(MatchPosition, match_list.items.len) catch {
+                allocator.free(line_content);
+                return null;
+            };
+            @memcpy(matches, match_list.items);
+        }
+
+        snippets[snippet_count] = .{
+            .line_number = line_num + 1,
+            .byte_offset = line_start,
+            .line_content = line_content,
+            .matches = matches,
+        };
+        snippet_count += 1;
+    }
+
+    return snippets[0..snippet_count];
+}
+
+fn extractRegexSnippetsStatic(path: []const u8, regex: *const PosixRegex, context_lines: u32, max_snippets_per_file: u32, allocator: std.mem.Allocator) ?[]ContextSnippet {
+    const file = std.fs.cwd().openFile(path, .{}) catch return null;
+    defer file.close();
+
+    const stat = file.stat() catch return null;
+    const size = stat.size;
+    if (size == 0) return null;
+
+    const data = posix.mmap(
+        null,
+        size,
+        posix.PROT.READ,
+        .{ .TYPE = .SHARED },
+        file.handle,
+        0,
+    ) catch return null;
+    defer posix.munmap(data);
+
+    var line_starts = std.ArrayList(usize).init(allocator);
+    defer line_starts.deinit();
+    line_starts.append(0) catch return null;
+
+    for (data, 0..) |byte, i| {
+        if (byte == '\n' and i + 1 < data.len) {
+            line_starts.append(i + 1) catch return null;
+        }
+    }
+
+    const matches = regex.findAll(data, allocator) catch return null;
+    defer allocator.free(matches);
+
+    if (matches.len == 0) return null;
+
+    var match_lines = std.AutoHashMap(u32, std.ArrayList(MatchPosition)).init(allocator);
+    defer {
+        var it = match_lines.valueIterator();
+        while (it.next()) |list| list.deinit();
+        match_lines.deinit();
+    }
+
+    for (matches) |m| {
+        const line_num = findLineNumberStatic(line_starts.items, m.start);
+        const line_start = line_starts.items[line_num];
+        const match_in_line = MatchPosition{
+            .start = m.start - line_start,
+            .end = m.end - line_start,
+        };
+
+        const entry = match_lines.getOrPut(line_num) catch return null;
+        if (!entry.found_existing) {
+            entry.value_ptr.* = std.ArrayList(MatchPosition).init(allocator);
+        }
+        entry.value_ptr.append(match_in_line) catch return null;
+    }
+
+    var lines_to_include = std.AutoHashMap(u32, void).init(allocator);
+    defer lines_to_include.deinit();
+
+    var match_it = match_lines.keyIterator();
+    while (match_it.next()) |line_num_ptr| {
+        const line_num = line_num_ptr.*;
+        const start_line: u32 = if (line_num >= context_lines) line_num - context_lines else 0;
+        const total_lines: u32 = @intCast(line_starts.items.len);
+        const end_line = @min(line_num + context_lines, total_lines - 1);
+
+        var l = start_line;
+        while (l <= end_line) : (l += 1) {
+            lines_to_include.put(l, {}) catch return null;
+        }
+    }
+
+    var sorted_lines = std.ArrayList(u32).init(allocator);
+    defer sorted_lines.deinit();
+    var lines_it = lines_to_include.keyIterator();
+    while (lines_it.next()) |k| {
+        sorted_lines.append(k.*) catch return null;
+    }
+    std.mem.sort(u32, sorted_lines.items, {}, std.sort.asc(u32));
+
+    const max_snippets = @min(sorted_lines.items.len, max_snippets_per_file);
+    var snippets = allocator.alloc(ContextSnippet, max_snippets) catch return null;
+    errdefer allocator.free(snippets);
+
+    var snippet_count: usize = 0;
+    for (sorted_lines.items) |line_num| {
+        if (snippet_count >= max_snippets) break;
+
+        const line_start = line_starts.items[line_num];
+        const line_end = if (line_num + 1 < line_starts.items.len)
+            line_starts.items[line_num + 1] - 1
+        else
+            data.len;
+
+        const line_len = line_end - line_start;
+        const line_content = allocator.alloc(u8, line_len) catch return null;
+        @memcpy(line_content, data[line_start..line_end]);
+
+        var match_positions: []MatchPosition = &[_]MatchPosition{};
+        if (match_lines.get(line_num)) |match_list| {
+            match_positions = allocator.alloc(MatchPosition, match_list.items.len) catch {
+                allocator.free(line_content);
+                return null;
+            };
+            @memcpy(match_positions, match_list.items);
+        }
+
+        snippets[snippet_count] = .{
+            .line_number = line_num + 1,
+            .byte_offset = line_start,
+            .line_content = line_content,
+            .matches = match_positions,
+        };
+        snippet_count += 1;
+    }
+
+    return snippets[0..snippet_count];
+}
+
+fn findLineNumberStatic(line_starts: []const usize, byte_offset: usize) u32 {
+    var low: usize = 0;
+    var high: usize = line_starts.len;
+    while (low < high) {
+        const mid = low + (high - low) / 2;
+        if (line_starts[mid] <= byte_offset) {
+            low = mid + 1;
+        } else {
+            high = mid;
+        }
+    }
+    return @intCast(if (low > 0) low - 1 else 0);
+}
 
 test "searcher basic" {
     const allocator = std.testing.allocator;
@@ -1024,6 +1467,140 @@ test "regex search with quantifiers" {
 
     // + quantifier
     const results = try searcher.searchRegex("hello+", 10);
+    defer searcher.freeResults(results);
+
+    try std.testing.expectEqual(@as(usize, 1), results.len);
+}
+
+test "parallel search with many files" {
+    const allocator = std.testing.allocator;
+    const test_path = "/tmp/hound_parallel_test.idx";
+    const test_dir = "/tmp/hound_parallel_files";
+    const index = @import("index.zig");
+
+    std.fs.cwd().deleteTree(test_dir) catch {};
+    try std.fs.cwd().makePath(test_dir);
+
+    const num_files = 20;
+    var file_contents: [num_files][]const u8 = undefined;
+    for (0..num_files) |i| {
+        const content = if (i % 3 == 0) "searchterm in this file" else "no match here";
+        file_contents[i] = content;
+    }
+
+    for (0..num_files) |i| {
+        var name_buf: [64]u8 = undefined;
+        const name = std.fmt.bufPrint(&name_buf, "{s}/file{d}.txt", .{ test_dir, i }) catch unreachable;
+        const file = try std.fs.cwd().createFile(name, .{});
+        defer file.close();
+        try file.writeAll(file_contents[i]);
+    }
+
+    {
+        var writer = try index.IndexWriter.init(allocator, test_path);
+        defer writer.deinit();
+
+        for (0..num_files) |i| {
+            var name_buf: [64]u8 = undefined;
+            const name = std.fmt.bufPrint(&name_buf, "{s}/file{d}.txt", .{ test_dir, i }) catch unreachable;
+            try writer.addFile(name, file_contents[i]);
+        }
+        try writer.finish();
+    }
+
+    var reader_inst = try IndexReader.open(allocator, test_path);
+    defer reader_inst.close();
+
+    var searcher = try Searcher.initWithOptions(allocator, &reader_inst, .{ .thread_count = 4 });
+    defer searcher.deinit();
+
+    const results = try searcher.search("searchterm", 50);
+    defer searcher.freeResults(results);
+
+    try std.testing.expectEqual(@as(usize, 7), results.len);
+
+    for (results) |r| {
+        try std.testing.expect(std.mem.indexOf(u8, r.snippets[0].line_content, "searchterm") != null);
+    }
+}
+
+test "parallel regex search with many files" {
+    const allocator = std.testing.allocator;
+    const test_path = "/tmp/hound_parallel_regex_test.idx";
+    const test_dir = "/tmp/hound_parallel_regex_files";
+    const index = @import("index.zig");
+
+    std.fs.cwd().deleteTree(test_dir) catch {};
+    try std.fs.cwd().makePath(test_dir);
+
+    const num_files = 16;
+    var file_contents: [num_files][]const u8 = undefined;
+    for (0..num_files) |i| {
+        const content = if (i % 4 == 0) "test123value here" else "nothing";
+        file_contents[i] = content;
+    }
+
+    for (0..num_files) |i| {
+        var name_buf: [64]u8 = undefined;
+        const name = std.fmt.bufPrint(&name_buf, "{s}/rfile{d}.txt", .{ test_dir, i }) catch unreachable;
+        const file = try std.fs.cwd().createFile(name, .{});
+        defer file.close();
+        try file.writeAll(file_contents[i]);
+    }
+
+    {
+        var writer = try index.IndexWriter.init(allocator, test_path);
+        defer writer.deinit();
+
+        for (0..num_files) |i| {
+            var name_buf: [64]u8 = undefined;
+            const name = std.fmt.bufPrint(&name_buf, "{s}/rfile{d}.txt", .{ test_dir, i }) catch unreachable;
+            try writer.addFile(name, file_contents[i]);
+        }
+        try writer.finish();
+    }
+
+    var reader_inst = try IndexReader.open(allocator, test_path);
+    defer reader_inst.close();
+
+    var searcher = try Searcher.initWithOptions(allocator, &reader_inst, .{ .thread_count = 4 });
+    defer searcher.deinit();
+
+    const results = try searcher.searchRegex("test[0-9]+value", 50);
+    defer searcher.freeResults(results);
+
+    try std.testing.expectEqual(@as(usize, 4), results.len);
+}
+
+test "single threaded fallback for small candidate sets" {
+    const allocator = std.testing.allocator;
+    const test_path = "/tmp/hound_single_thread_test.idx";
+    const test_dir = "/tmp/hound_single_thread_files";
+    const index = @import("index.zig");
+
+    std.fs.cwd().deleteTree(test_dir) catch {};
+    try std.fs.cwd().makePath(test_dir);
+
+    {
+        const file = try std.fs.cwd().createFile(test_dir ++ "/small.txt", .{});
+        defer file.close();
+        try file.writeAll("unique content here");
+    }
+
+    {
+        var writer = try index.IndexWriter.init(allocator, test_path);
+        defer writer.deinit();
+        try writer.addFile(test_dir ++ "/small.txt", "unique content here");
+        try writer.finish();
+    }
+
+    var reader_inst = try IndexReader.open(allocator, test_path);
+    defer reader_inst.close();
+
+    var searcher = try Searcher.initWithOptions(allocator, &reader_inst, .{ .thread_count = 8 });
+    defer searcher.deinit();
+
+    const results = try searcher.search("unique", 10);
     defer searcher.freeResults(results);
 
     try std.testing.expectEqual(@as(usize, 1), results.len);

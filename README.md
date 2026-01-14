@@ -6,6 +6,7 @@ Fast text search library with trigram indexing, inspired by [Google Code Search]
 
 - **Trigram indexing** - Fast substring search using 3-character n-grams
 - **Regex search** - Filter candidates by extracting trigrams from regex patterns, then verify with full regex match
+- **Parallel search** - Multi-threaded file verification for faster search on multi-core systems
 - **Ranked results** - Files ranked by how many query trigrams match
 - **Context snippets** - Search results include matching lines with surrounding context, line numbers, and match positions
 - **File watching** - Incremental updates via inotify (Linux) / kqueue (macOS)
@@ -62,6 +63,14 @@ defer searcher.freeResults(regex_results);
 for (regex_results) |r| {
     std.debug.print("{s}: {d} regex matches\n", .{ r.name, r.match_count });
 }
+
+// Configure thread count for parallel search
+var parallel_searcher = try hound.search.Searcher.initWithOptions(allocator, &reader, .{
+    .thread_count = 8,  // 0 = auto-detect CPU count
+    .context_lines = 2,
+    .max_snippets_per_file = 10,
+});
+defer parallel_searcher.deinit();
 ```
 
 ### Incremental Indexing with File Watching
@@ -162,6 +171,15 @@ for r in results {
 | `index_path` | `[]const u8` | required | Path to the index file |
 | `batch_window_ms` | `u32` | `1000` | Milliseconds to wait before processing batched file changes |
 | `enable_watcher` | `bool` | `true` | Enable file system watching (inotify/kqueue) |
+
+### SearchOptions
+
+| Option | Type | Default | Description |
+|--------|------|---------|-------------|
+| `max_results` | `usize` | `100` | Maximum number of results to return |
+| `context_lines` | `u32` | `2` | Number of context lines around matches |
+| `max_snippets_per_file` | `u32` | `10` | Maximum snippets per file |
+| `thread_count` | `u32` | `0` | Number of threads for parallel verification (0 = auto-detect CPU count, capped at 16) |
 
 ### Storage Locations
 
