@@ -162,4 +162,114 @@ public class Hound {
             return hound_incremental_indexer_has_pending_changes(handle)
         }
     }
+    
+    // MARK: - Segment Index Writer
+    
+    /// Segment-based index writer with incremental updates and atomic commits
+    public class SegmentIndexWriter {
+        private var handle: OpaquePointer?
+        
+        public init?(directory: String) {
+            handle = hound_segment_index_writer_create(directory)
+            if handle == nil { return nil }
+        }
+        
+        deinit {
+            if let handle = handle {
+                hound_segment_index_writer_destroy(handle)
+            }
+        }
+        
+        public func addFile(name: String, content: Data) -> Bool {
+            guard let handle = handle else { return false }
+            return content.withUnsafeBytes { buffer in
+                guard let ptr = buffer.baseAddress?.assumingMemoryBound(to: UInt8.self) else {
+                    return false
+                }
+                return hound_segment_index_writer_add_file(handle, name, ptr, buffer.count)
+            }
+        }
+        
+        public func addFile(name: String, content: String) -> Bool {
+            addFile(name: name, content: Data(content.utf8))
+        }
+        
+        public func deleteFile(name: String) -> Bool {
+            guard let handle = handle else { return false }
+            return hound_segment_index_writer_delete_file(handle, name)
+        }
+        
+        public func commit() -> Bool {
+            guard let handle = handle else { return false }
+            return hound_segment_index_writer_commit(handle)
+        }
+        
+        public var segmentCount: Int {
+            guard let handle = handle else { return 0 }
+            return hound_segment_index_writer_segment_count(handle)
+        }
+        
+        public var documentCount: UInt64 {
+            guard let handle = handle else { return 0 }
+            return hound_segment_index_writer_document_count(handle)
+        }
+    }
+    
+    // MARK: - Segment Index Reader
+    
+    /// Segment-based index reader
+    public class SegmentIndexReader {
+        fileprivate var handle: OpaquePointer?
+        
+        public init?(directory: String) {
+            handle = hound_segment_index_reader_open(directory)
+            if handle == nil { return nil }
+        }
+        
+        deinit {
+            if let handle = handle {
+                hound_segment_index_reader_close(handle)
+            }
+        }
+        
+        public var segmentCount: Int {
+            guard let handle = handle else { return 0 }
+            return hound_segment_index_reader_segment_count(handle)
+        }
+        
+        public var documentCount: UInt64 {
+            guard let handle = handle else { return 0 }
+            return hound_segment_index_reader_document_count(handle)
+        }
+        
+        public func getName(globalId: UInt32) -> String? {
+            guard let handle = handle else { return nil }
+            var len: Int = 0
+            guard let ptr = hound_segment_index_reader_get_name(handle, globalId, &len) else {
+                return nil
+            }
+            let buffer = UnsafeBufferPointer(start: ptr, count: len)
+            return buffer.withMemoryRebound(to: UInt8.self) { bytes in
+                String(bytes: bytes, encoding: .utf8)
+            }
+        }
+        
+        public func lookupTrigram(_ trigram: (UInt8, UInt8, UInt8)) -> [UInt32] {
+            guard let handle = handle else { return [] }
+            var count: Int = 0
+            guard let results = hound_segment_index_reader_lookup_trigram(
+                handle, trigram.0, trigram.1, trigram.2, &count
+            ) else {
+                return []
+            }
+            defer { hound_free_trigram_results(results, count) }
+            return Array(UnsafeBufferPointer(start: results, count: count))
+        }
+        
+        public func lookupTrigram(_ chars: String) -> [UInt32] {
+            let bytes = Array(chars.utf8)
+            guard bytes.count >= 3 else { return [] }
+            return lookupTrigram((bytes[0], bytes[1], bytes[2]))
+        }
+    }
 }

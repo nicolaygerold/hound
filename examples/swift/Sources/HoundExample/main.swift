@@ -69,9 +69,58 @@ guard indexer.rebuild() else {
 }
 print("Rebuilt index")
 
+// Test 4: Segment-based index
+print("\n=== Test 4: Segment-Based Index ===")
+let segmentDir = "/tmp/hound_swift_segment_test"
+try? fm.removeItem(atPath: segmentDir)
+
+// Create segment index
+guard let segWriter = Hound.SegmentIndexWriter(directory: segmentDir) else {
+    fatalError("Could not create segment index writer")
+}
+
+_ = segWriter.addFile(name: "a.txt", content: "hello world from segment index")
+_ = segWriter.addFile(name: "b.txt", content: "foo bar hello")
+guard segWriter.commit() else {
+    fatalError("Could not commit segment")
+}
+print("Commit 1: segments=\(segWriter.segmentCount), docs=\(segWriter.documentCount)")
+
+// Add more files in second commit
+_ = segWriter.addFile(name: "c.txt", content: "hello again")
+guard segWriter.commit() else {
+    fatalError("Could not commit segment")
+}
+print("Commit 2: segments=\(segWriter.segmentCount), docs=\(segWriter.documentCount)")
+
+// Delete a file
+guard segWriter.deleteFile(name: "b.txt") else {
+    fatalError("Could not delete file")
+}
+guard segWriter.commit() else {
+    fatalError("Could not commit deletion")
+}
+print("Commit 3 (delete): segments=\(segWriter.segmentCount), docs=\(segWriter.documentCount)")
+
+// Read segment index
+guard let segReader = Hound.SegmentIndexReader(directory: segmentDir) else {
+    fatalError("Could not open segment index reader")
+}
+print("\nSegment reader: segments=\(segReader.segmentCount), docs=\(segReader.documentCount)")
+
+// Trigram search
+let matches = segReader.lookupTrigram("hel")
+print("Trigram 'hel' matches: \(matches.count) files")
+for gid in matches {
+    if let name = segReader.getName(globalId: gid) {
+        print("  - \(name)")
+    }
+}
+
 // Cleanup
 try? fm.removeItem(atPath: testDir)
 try? fm.removeItem(atPath: indexPath)
 try? fm.removeItem(atPath: incrIndexPath)
+try? fm.removeItem(atPath: segmentDir)
 
 print("\n=== ALL TESTS PASSED ===")
