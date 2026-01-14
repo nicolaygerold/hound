@@ -263,6 +263,28 @@ pub const Searcher = struct {
     };
 
     fn extractSnippets(self: *Searcher, path: []const u8, query: []const u8) ?[]ContextSnippet {
+        // Check if filename matches - return filename-only snippet
+        if (std.mem.indexOf(u8, path, query)) |match_start| {
+            const snippets = self.allocator.alloc(ContextSnippet, 1) catch return null;
+            const path_copy = self.allocator.dupe(u8, path) catch {
+                self.allocator.free(snippets);
+                return null;
+            };
+            const matches = self.allocator.alloc(MatchPosition, 1) catch {
+                self.allocator.free(path_copy);
+                self.allocator.free(snippets);
+                return null;
+            };
+            matches[0] = .{ .start = match_start, .end = match_start + query.len };
+            snippets[0] = .{
+                .line_number = 0,
+                .byte_offset = 0,
+                .line_content = path_copy,
+                .matches = matches,
+            };
+            return snippets;
+        }
+
         const file = std.fs.cwd().openFile(path, .{}) catch return null;
         defer file.close();
 
@@ -801,6 +823,28 @@ pub const Searcher = struct {
 };
 
 fn extractSnippetsStatic(path: []const u8, query: []const u8, context_lines: u32, max_snippets_per_file: u32, allocator: std.mem.Allocator) ?[]ContextSnippet {
+    // Check if filename matches - return filename-only snippet
+    if (std.mem.indexOf(u8, path, query)) |match_start| {
+        const snippets = allocator.alloc(ContextSnippet, 1) catch return null;
+        const path_copy = allocator.dupe(u8, path) catch {
+            allocator.free(snippets);
+            return null;
+        };
+        const matches = allocator.alloc(MatchPosition, 1) catch {
+            allocator.free(path_copy);
+            allocator.free(snippets);
+            return null;
+        };
+        matches[0] = .{ .start = match_start, .end = match_start + query.len };
+        snippets[0] = .{
+            .line_number = 0,
+            .byte_offset = 0,
+            .line_content = path_copy,
+            .matches = matches,
+        };
+        return snippets;
+    }
+
     const file = std.fs.cwd().openFile(path, .{}) catch return null;
     defer file.close();
 
