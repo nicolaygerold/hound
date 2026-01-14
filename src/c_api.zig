@@ -4,6 +4,8 @@ const reader_mod = @import("reader.zig");
 const search_mod = @import("search.zig");
 const incremental_mod = @import("incremental.zig");
 const state_mod = @import("state.zig");
+const segment_index_mod = @import("segment_index.zig");
+const trigram_mod = @import("trigram.zig");
 
 const IndexWriter = index_mod.IndexWriter;
 const IndexReader = reader_mod.IndexReader;
@@ -12,6 +14,8 @@ const SearchResult = search_mod.SearchResult;
 const ContextSnippet = search_mod.ContextSnippet;
 const MatchPosition = search_mod.MatchPosition;
 const IncrementalIndexer = incremental_mod.IncrementalIndexer;
+const SegmentIndexWriter = segment_index_mod.SegmentIndexWriter;
+const SegmentIndexReader = segment_index_mod.SegmentIndexReader;
 
 var gpa = std.heap.GeneralPurposeAllocator(.{}){};
 const allocator = gpa.allocator();
@@ -317,6 +321,126 @@ pub export fn hound_incremental_indexer_poll_events(indexer_ptr: ?*HoundIncremen
 pub export fn hound_incremental_indexer_has_pending_changes(indexer_ptr: ?*HoundIncrementalIndexer) bool {
     const indexer: *IncrementalIndexer = @ptrCast(@alignCast(indexer_ptr orelse return false));
     return indexer.hasPendingChanges();
+}
+
+// ============================================================================
+// Segment Index Writer API
+// ============================================================================
+
+pub const HoundSegmentIndexWriter = opaque {};
+
+pub export fn hound_segment_index_writer_create(dir: [*:0]const u8) ?*HoundSegmentIndexWriter {
+    const writer = allocator.create(SegmentIndexWriter) catch return null;
+    writer.* = SegmentIndexWriter.init(allocator, std.mem.span(dir)) catch {
+        allocator.destroy(writer);
+        return null;
+    };
+    return @ptrCast(writer);
+}
+
+pub export fn hound_segment_index_writer_add_file(
+    writer_ptr: ?*HoundSegmentIndexWriter,
+    name: [*:0]const u8,
+    content: [*]const u8,
+    content_len: usize,
+) bool {
+    const writer: *SegmentIndexWriter = @ptrCast(@alignCast(writer_ptr orelse return false));
+    writer.addFile(std.mem.span(name), content[0..content_len]) catch return false;
+    return true;
+}
+
+pub export fn hound_segment_index_writer_delete_file(
+    writer_ptr: ?*HoundSegmentIndexWriter,
+    name: [*:0]const u8,
+) bool {
+    const writer: *SegmentIndexWriter = @ptrCast(@alignCast(writer_ptr orelse return false));
+    writer.deleteFile(std.mem.span(name)) catch return false;
+    return true;
+}
+
+pub export fn hound_segment_index_writer_commit(writer_ptr: ?*HoundSegmentIndexWriter) bool {
+    const writer: *SegmentIndexWriter = @ptrCast(@alignCast(writer_ptr orelse return false));
+    writer.commit() catch return false;
+    return true;
+}
+
+pub export fn hound_segment_index_writer_segment_count(writer_ptr: ?*HoundSegmentIndexWriter) usize {
+    const writer: *SegmentIndexWriter = @ptrCast(@alignCast(writer_ptr orelse return 0));
+    return writer.segmentCount();
+}
+
+pub export fn hound_segment_index_writer_document_count(writer_ptr: ?*HoundSegmentIndexWriter) u64 {
+    const writer: *SegmentIndexWriter = @ptrCast(@alignCast(writer_ptr orelse return 0));
+    return writer.documentCount();
+}
+
+pub export fn hound_segment_index_writer_destroy(writer_ptr: ?*HoundSegmentIndexWriter) void {
+    const writer: *SegmentIndexWriter = @ptrCast(@alignCast(writer_ptr orelse return));
+    writer.deinit();
+    allocator.destroy(writer);
+}
+
+// ============================================================================
+// Segment Index Reader API
+// ============================================================================
+
+pub const HoundSegmentIndexReader = opaque {};
+
+pub export fn hound_segment_index_reader_open(dir: [*:0]const u8) ?*HoundSegmentIndexReader {
+    const reader = allocator.create(SegmentIndexReader) catch return null;
+    reader.* = SegmentIndexReader.open(allocator, std.mem.span(dir)) catch {
+        allocator.destroy(reader);
+        return null;
+    };
+    return @ptrCast(reader);
+}
+
+pub export fn hound_segment_index_reader_close(reader_ptr: ?*HoundSegmentIndexReader) void {
+    const reader: *SegmentIndexReader = @ptrCast(@alignCast(reader_ptr orelse return));
+    reader.close();
+    allocator.destroy(reader);
+}
+
+pub export fn hound_segment_index_reader_segment_count(reader_ptr: ?*HoundSegmentIndexReader) usize {
+    const reader: *SegmentIndexReader = @ptrCast(@alignCast(reader_ptr orelse return 0));
+    return reader.segmentCount();
+}
+
+pub export fn hound_segment_index_reader_document_count(reader_ptr: ?*HoundSegmentIndexReader) u64 {
+    const reader: *SegmentIndexReader = @ptrCast(@alignCast(reader_ptr orelse return 0));
+    return reader.documentCount();
+}
+
+pub export fn hound_segment_index_reader_get_name(
+    reader_ptr: ?*HoundSegmentIndexReader,
+    global_id: u32,
+    out_len: *usize,
+) ?[*]const u8 {
+    const reader: *SegmentIndexReader = @ptrCast(@alignCast(reader_ptr orelse return null));
+    const name = reader.getName(global_id) orelse return null;
+    out_len.* = name.len;
+    return name.ptr;
+}
+
+pub export fn hound_segment_index_reader_lookup_trigram(
+    reader_ptr: ?*HoundSegmentIndexReader,
+    b0: u8,
+    b1: u8,
+    b2: u8,
+    out_count: *usize,
+) ?[*]u32 {
+    const reader: *SegmentIndexReader = @ptrCast(@alignCast(reader_ptr orelse return null));
+    const tri = trigram_mod.fromBytes(b0, b1, b2);
+    var iter = reader.lookupTrigram(tri);
+    const matches = iter.collect(allocator) catch return null;
+    out_count.* = matches.len;
+    return matches.ptr;
+}
+
+pub export fn hound_free_trigram_results(results: ?[*]u32, count: usize) void {
+    if (results) |ptr| {
+        allocator.free(ptr[0..count]);
+    }
 }
 
 // ============================================================================

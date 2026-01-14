@@ -23,6 +23,8 @@ typedef struct HoundIndexWriter HoundIndexWriter;
 typedef struct HoundIndexReader HoundIndexReader;
 typedef struct HoundSearcher HoundSearcher;
 typedef struct HoundIncrementalIndexer HoundIncrementalIndexer;
+typedef struct HoundSegmentIndexWriter HoundSegmentIndexWriter;
+typedef struct HoundSegmentIndexReader HoundSegmentIndexReader;
 
 /* ============================================================================
  * Search Result Types
@@ -236,6 +238,154 @@ bool hound_incremental_indexer_poll_events(HoundIncrementalIndexer* indexer);
  * @return true if there are pending changes.
  */
 bool hound_incremental_indexer_has_pending_changes(HoundIncrementalIndexer* indexer);
+
+/* ============================================================================
+ * Segment Index Writer API
+ *
+ * Segment-based index with incremental updates and atomic commits.
+ * ============================================================================ */
+
+/**
+ * Create a segment index writer.
+ *
+ * @param dir Directory path where index will be stored (null-terminated).
+ * @return Writer handle, or NULL on failure.
+ */
+HoundSegmentIndexWriter* hound_segment_index_writer_create(const char* dir);
+
+/**
+ * Add a file to the index.
+ *
+ * @param writer Writer handle.
+ * @param name File name/path (null-terminated).
+ * @param content File content bytes.
+ * @param content_len Length of content.
+ * @return true on success, false on failure.
+ */
+bool hound_segment_index_writer_add_file(
+    HoundSegmentIndexWriter* writer,
+    const char* name,
+    const uint8_t* content,
+    size_t content_len
+);
+
+/**
+ * Delete a file from the index.
+ *
+ * @param writer Writer handle.
+ * @param name File name/path (null-terminated).
+ * @return true on success, false on failure.
+ */
+bool hound_segment_index_writer_delete_file(
+    HoundSegmentIndexWriter* writer,
+    const char* name
+);
+
+/**
+ * Commit pending changes atomically.
+ *
+ * @param writer Writer handle.
+ * @return true on success, false on failure.
+ */
+bool hound_segment_index_writer_commit(HoundSegmentIndexWriter* writer);
+
+/**
+ * Get the number of segments.
+ *
+ * @param writer Writer handle.
+ * @return Number of segments.
+ */
+size_t hound_segment_index_writer_segment_count(HoundSegmentIndexWriter* writer);
+
+/**
+ * Get the number of live documents.
+ *
+ * @param writer Writer handle.
+ * @return Number of live documents.
+ */
+uint64_t hound_segment_index_writer_document_count(HoundSegmentIndexWriter* writer);
+
+/**
+ * Destroy the writer and free resources.
+ *
+ * @param writer Writer handle.
+ */
+void hound_segment_index_writer_destroy(HoundSegmentIndexWriter* writer);
+
+/* ============================================================================
+ * Segment Index Reader API
+ * ============================================================================ */
+
+/**
+ * Open a segment index for reading.
+ *
+ * @param dir Directory path (null-terminated).
+ * @return Reader handle, or NULL on failure.
+ */
+HoundSegmentIndexReader* hound_segment_index_reader_open(const char* dir);
+
+/**
+ * Close the reader and free resources.
+ *
+ * @param reader Reader handle.
+ */
+void hound_segment_index_reader_close(HoundSegmentIndexReader* reader);
+
+/**
+ * Get the number of segments.
+ *
+ * @param reader Reader handle.
+ * @return Number of segments.
+ */
+size_t hound_segment_index_reader_segment_count(HoundSegmentIndexReader* reader);
+
+/**
+ * Get the number of live documents.
+ *
+ * @param reader Reader handle.
+ * @return Number of live documents.
+ */
+uint64_t hound_segment_index_reader_document_count(HoundSegmentIndexReader* reader);
+
+/**
+ * Get the name of a document by global ID.
+ *
+ * @param reader Reader handle.
+ * @param global_id Global document ID.
+ * @param out_len Output: length of the name.
+ * @return Pointer to name string (not null-terminated), or NULL if not found.
+ */
+const char* hound_segment_index_reader_get_name(
+    HoundSegmentIndexReader* reader,
+    uint32_t global_id,
+    size_t* out_len
+);
+
+/**
+ * Look up a trigram and get matching document IDs.
+ *
+ * @param reader Reader handle.
+ * @param b0 First byte of trigram.
+ * @param b1 Second byte of trigram.
+ * @param b2 Third byte of trigram.
+ * @param out_count Output: number of matching documents.
+ * @return Array of global document IDs. Must be freed with hound_free_trigram_results().
+ */
+uint32_t* hound_segment_index_reader_lookup_trigram(
+    HoundSegmentIndexReader* reader,
+    uint8_t b0,
+    uint8_t b1,
+    uint8_t b2,
+    size_t* out_count
+);
+
+/**
+ * Free trigram lookup results.
+ *
+ * @param results Array from hound_segment_index_reader_lookup_trigram.
+ * @param count Number of elements.
+ */
+void hound_free_trigram_results(uint32_t* results, size_t count);
 
 /* ============================================================================
  * Utility API
