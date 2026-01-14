@@ -1,0 +1,4 @@
+module CHound {
+    header "shim.h"
+    export *
+}
