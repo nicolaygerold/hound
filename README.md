@@ -18,6 +18,31 @@ Fast text search library with trigram indexing, inspired by [Google Code Search]
 
 ## Installation
 
+### Zig (using package manager)
+
+Add to your `build.zig.zon`:
+
+```zig
+.dependencies = .{
+    .hound = .{
+        .url = "https://github.com/nicolaygerold/hound/archive/refs/heads/main.tar.gz",
+        // Run `zig fetch <url>` to get the hash
+    },
+},
+```
+
+Then in your `build.zig`:
+
+```zig
+const hound = b.dependency("hound", .{
+    .target = target,
+    .optimize = optimize,
+});
+exe.root_module.addImport("hound", hound.module("hound"));
+```
+
+### Build from source
+
 ```bash
 zig build -Doptimize=ReleaseFast
 ```
@@ -27,6 +52,20 @@ Outputs:
 - `zig-out/lib/libhound_c.a` - C API static library
 - `zig-out/lib/libhound_c.dylib` - C API dynamic library
 - `zig-out/include/hound.h` - C header
+
+### Swift
+
+1. Build the library:
+   ```bash
+   zig build -Doptimize=ReleaseFast
+   ```
+
+2. Copy files to your project:
+   - `zig-out/lib/libhound_c.dylib` → your app's Frameworks folder
+   - `include/hound.h` → your bridging header or module
+   - `examples/swift/Sources/HoundExample/Hound.swift` → your Swift sources
+
+3. See [examples/swift/](examples/swift/) for a complete SPM example
 
 ## Usage
 
