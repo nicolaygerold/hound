@@ -94,7 +94,10 @@ pub const IndexWriter = struct {
     }
 
     pub fn addFile(self: *IndexWriter, name: []const u8, content: []const u8) !void {
-        const trigrams = self.extractor.extract(content) catch |err| switch (err) {
+        const combined = try std.mem.concat(self.allocator, u8, &.{ name, "\n", content });
+        defer self.allocator.free(combined);
+
+        const trigrams = self.extractor.extract(combined) catch |err| switch (err) {
             error.ContainsNul, error.InvalidUtf8, error.FileTooLong, error.LineTooLong, error.TooManyTrigrams => return,
             error.OutOfMemory => return err,
         };

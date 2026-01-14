@@ -118,14 +118,14 @@ pub const PositionalIndexWriter = struct {
         const name_copy = try self.allocator.dupe(u8, name);
         try self.names.append(name_copy);
 
-        const content_copy = try self.allocator.dupe(u8, content);
-        try self.contents.append(content_copy);
+        const combined = try std.mem.concat(self.allocator, u8, &.{ name, "\n", content });
+        try self.contents.append(combined);
 
         const sampler = try self.allocator.create(position.RuneOffsetSampler);
         sampler.* = position.RuneOffsetSampler.init(self.allocator);
         try self.rune_samplers.append(sampler);
 
-        self.extractPositionalTrigrams(file_id, content_copy, sampler) catch |err| switch (err) {
+        self.extractPositionalTrigrams(file_id, combined, sampler) catch |err| switch (err) {
             error.ContainsNul, error.InvalidUtf8, error.FileTooLong, error.LineTooLong => return,
             error.OutOfMemory => return err,
         };

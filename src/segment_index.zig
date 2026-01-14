@@ -778,87 +778,87 @@ test "segment index update existing file" {
 test "e2e segment workflow with files on disk" {
     const allocator = std.testing.allocator;
     const test_dir = "/tmp/hound_e2e_manual";
-    
+
     std.fs.cwd().deleteTree(test_dir) catch {};
     defer std.fs.cwd().deleteTree(test_dir) catch {};
-    
+
     // First commit: add 2 files
     {
         var writer = try SegmentIndexWriter.init(allocator, test_dir);
         defer writer.deinit();
-        
+
         try writer.addFile("hello.txt", "hello world");
         try writer.addFile("foo.txt", "hello there foo bar");
         try writer.commit();
-        
+
         try std.testing.expectEqual(@as(usize, 1), writer.segmentCount());
         try std.testing.expectEqual(@as(u64, 2), writer.documentCount());
     }
-    
+
     // Second commit: add 1 more file
     {
         var writer = try SegmentIndexWriter.init(allocator, test_dir);
         defer writer.deinit();
-        
+
         try writer.addFile("code.zig", "pub fn hello() void {}");
         try writer.commit();
-        
+
         try std.testing.expectEqual(@as(usize, 2), writer.segmentCount());
         try std.testing.expectEqual(@as(u64, 3), writer.documentCount());
     }
-    
+
     // Read and verify trigram search
     {
         var reader = try SegmentIndexReader.open(allocator, test_dir);
         defer reader.close();
-        
+
         try std.testing.expectEqual(@as(usize, 2), reader.segmentCount());
         try std.testing.expectEqual(@as(u64, 3), reader.documentCount());
-        
+
         // Search for "hel" trigram - should find 3 files
         const tri_hel = trigram_mod.fromBytes('h', 'e', 'l');
         var iter = reader.lookupTrigram(tri_hel);
         const matches = try iter.collect(allocator);
         defer allocator.free(matches);
-        
+
         try std.testing.expectEqual(@as(usize, 3), matches.len);
     }
-    
+
     // Third commit: delete foo.txt
     {
         var writer = try SegmentIndexWriter.init(allocator, test_dir);
         defer writer.deinit();
-        
+
         try writer.deleteFile("foo.txt");
         try writer.commit();
-        
+
         try std.testing.expectEqual(@as(u64, 2), writer.documentCount());
     }
-    
+
     // Verify deletion works in search
     {
         var reader = try SegmentIndexReader.open(allocator, test_dir);
         defer reader.close();
-        
+
         try std.testing.expectEqual(@as(u64, 2), reader.documentCount());
-        
+
         const tri_hel = trigram_mod.fromBytes('h', 'e', 'l');
         var iter = reader.lookupTrigram(tri_hel);
         const matches = try iter.collect(allocator);
         defer allocator.free(matches);
-        
+
         // Should now find only 2 files (foo.txt deleted)
         try std.testing.expectEqual(@as(usize, 2), matches.len);
     }
-    
+
     // Fourth commit: update hello.txt
     {
         var writer = try SegmentIndexWriter.init(allocator, test_dir);
         defer writer.deinit();
-        
+
         try writer.addFile("hello.txt", "updated hello content");
         try writer.commit();
-        
+
         // Still 2 docs (old hello.txt deleted, new one added)
         try std.testing.expectEqual(@as(u64, 2), writer.documentCount());
         // But now 3 segments

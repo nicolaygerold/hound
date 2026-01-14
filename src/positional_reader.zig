@@ -397,8 +397,9 @@ test "positional index reader trigram lookup with positions" {
 
     try std.testing.expectEqual(@as(u32, 0), entry.file_id);
     try std.testing.expectEqual(@as(usize, 2), entry.positions.len);
-    try std.testing.expectEqual(@as(u32, 0), entry.positions[0].byte_offset);
-    try std.testing.expectEqual(@as(u32, 4), entry.positions[1].byte_offset);
+    // Filename "test.txt\n" (9 bytes) is prepended, so "abc" appears at offset 9 and 13
+    try std.testing.expectEqual(@as(u32, 9), entry.positions[0].byte_offset);
+    try std.testing.expectEqual(@as(u32, 13), entry.positions[1].byte_offset);
 }
 
 test "proximity search" {
