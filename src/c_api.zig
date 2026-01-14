@@ -9,6 +9,8 @@ const IndexWriter = index_mod.IndexWriter;
 const IndexReader = reader_mod.IndexReader;
 const Searcher = search_mod.Searcher;
 const SearchResult = search_mod.SearchResult;
+const ContextSnippet = search_mod.ContextSnippet;
+const MatchPosition = search_mod.MatchPosition;
 const IncrementalIndexer = incremental_mod.IncrementalIndexer;
 
 var gpa = std.heap.GeneralPurposeAllocator(.{}){};
@@ -89,11 +91,27 @@ pub export fn hound_index_reader_trigram_count(reader_ptr: ?*HoundIndexReader) u
 
 pub const HoundSearcher = opaque {};
 
+pub const HoundMatchPosition = extern struct {
+    start: usize,
+    end: usize,
+};
+
+pub const HoundContextSnippet = extern struct {
+    line_number: u32,
+    byte_offset: usize,
+    line_content: [*:0]const u8,
+    line_content_len: usize,
+    matches: [*]HoundMatchPosition,
+    match_count: usize,
+};
+
 pub const HoundSearchResult = extern struct {
     file_id: u32,
     match_count: u32,
     name: [*:0]const u8,
     name_len: usize,
+    snippets: [*]HoundContextSnippet,
+    snippet_count: usize,
 };
 
 pub const HoundSearchResults = extern struct {
@@ -139,36 +157,101 @@ pub export fn hound_search(
 
     for (results, 0..) |r, i| {
         const name_copy = allocator.allocSentinel(u8, r.name.len, 0) catch {
-            for (0..i) |j| allocator.free(std.mem.span(c_results[j].name));
-            allocator.free(c_results);
+            freePartialCResults(c_results, i);
             searcher.freeResults(results);
             return null;
         };
         @memcpy(name_copy, r.name);
+
+        const c_snippets = allocator.alloc(HoundContextSnippet, r.snippets.len) catch {
+            allocator.free(name_copy);
+            freePartialCResults(c_results, i);
+            searcher.freeResults(results);
+            return null;
+        };
+
+        for (r.snippets, 0..) |snippet, si| {
+            const line_copy = allocator.allocSentinel(u8, snippet.line_content.len, 0) catch {
+                for (0..si) |sj| {
+                    allocator.free(std.mem.span(c_snippets[sj].line_content));
+                    if (c_snippets[sj].match_count > 0) allocator.free(c_snippets[sj].matches[0..c_snippets[sj].match_count]);
+                }
+                allocator.free(c_snippets);
+                allocator.free(name_copy);
+                freePartialCResults(c_results, i);
+                searcher.freeResults(results);
+                return null;
+            };
+            @memcpy(line_copy, snippet.line_content);
+
+            const c_matches = allocator.alloc(HoundMatchPosition, snippet.matches.len) catch {
+                allocator.free(line_copy);
+                for (0..si) |sj| {
+                    allocator.free(std.mem.span(c_snippets[sj].line_content));
+                    if (c_snippets[sj].match_count > 0) allocator.free(c_snippets[sj].matches[0..c_snippets[sj].match_count]);
+                }
+                allocator.free(c_snippets);
+                allocator.free(name_copy);
+                freePartialCResults(c_results, i);
+                searcher.freeResults(results);
+                return null;
+            };
+
+            for (snippet.matches, 0..) |m, mi| {
+                c_matches[mi] = .{ .start = m.start, .end = m.end };
+            }
+
+            c_snippets[si] = .{
+                .line_number = snippet.line_number,
+                .byte_offset = snippet.byte_offset,
+                .line_content = line_copy.ptr,
+                .line_content_len = snippet.line_content.len,
+                .matches = c_matches.ptr,
+                .match_count = snippet.matches.len,
+            };
+        }
 
         c_results[i] = .{
             .file_id = r.file_id,
             .match_count = r.match_count,
             .name = name_copy.ptr,
             .name_len = r.name.len,
+            .snippets = c_snippets.ptr,
+            .snippet_count = r.snippets.len,
         };
     }
 
     searcher.freeResults(results);
 
     const output = allocator.create(HoundSearchResults) catch {
-        for (c_results) |cr| allocator.free(std.mem.span(cr.name));
-        allocator.free(c_results);
+        freePartialCResults(c_results, c_results.len);
         return null;
     };
     output.* = .{ .results = c_results.ptr, .count = c_results.len };
     return output;
 }
 
+fn freePartialCResults(c_results: []HoundSearchResult, count: usize) void {
+    for (c_results[0..count]) |cr| {
+        for (cr.snippets[0..cr.snippet_count]) |snippet| {
+            allocator.free(std.mem.span(snippet.line_content));
+            if (snippet.match_count > 0) allocator.free(snippet.matches[0..snippet.match_count]);
+        }
+        if (cr.snippet_count > 0) allocator.free(cr.snippets[0..cr.snippet_count]);
+        allocator.free(std.mem.span(cr.name));
+    }
+    allocator.free(c_results);
+}
+
 pub export fn hound_search_results_free(results_ptr: ?*HoundSearchResults) void {
     const results: *HoundSearchResults = results_ptr orelse return;
     if (results.count > 0) {
         for (results.results[0..results.count]) |r| {
+            for (r.snippets[0..r.snippet_count]) |snippet| {
+                allocator.free(std.mem.span(snippet.line_content));
+                if (snippet.match_count > 0) allocator.free(snippet.matches[0..snippet.match_count]);
+            }
+            if (r.snippet_count > 0) allocator.free(r.snippets[0..r.snippet_count]);
             allocator.free(std.mem.span(r.name));
         }
         allocator.free(results.results[0..results.count]);
