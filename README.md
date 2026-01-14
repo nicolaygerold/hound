@@ -5,6 +5,7 @@ Fast text search library with trigram indexing, inspired by [Google Code Search]
 ## Features
 
 - **Trigram indexing** - Fast substring search using 3-character n-grams
+- **Positional trigrams** - Store byte/rune offsets where each trigram appears, enabling proximity queries
 - **Regex search** - Filter candidates by extracting trigrams from regex patterns, then verify with full regex match
 - **Parallel search** - Multi-threaded file verification for faster search on multi-core systems
 - **Ranked results** - Files ranked by how many query trigrams match
@@ -71,6 +72,39 @@ var parallel_searcher = try hound.search.Searcher.initWithOptions(allocator, &re
     .max_snippets_per_file = 10,
 });
 defer parallel_searcher.deinit();
+```
+
+#### Positional Index with Proximity Search
+
+```zig
+const hound = @import("hound");
+
+// Create positional index
+var writer = try hound.positional_index.PositionalIndexWriter.init(allocator, "index.hound");
+try writer.addFile("main.zig", file_content);
+try writer.finish();
+writer.deinit();
+
+// Open and search
+var reader = try hound.positional_reader.PositionalIndexReader.open(allocator, "index.hound");
+defer reader.close();
+
+// Proximity search: find files where "abc" and "def" appear within 10 runes of each other
+const tri_abc = hound.trigram.fromBytes('a', 'b', 'c');
+const tri_def = hound.trigram.fromBytes('d', 'e', 'f');
+
+const results = try hound.positional_reader.proximitySearch(
+    allocator,
+    &reader,
+    tri_abc,
+    tri_def,
+    10,  // max distance in runes
+);
+defer allocator.free(results);
+
+for (results) |file_id| {
+    std.debug.print("Match in file: {s}\n", .{reader.getName(file_id).?});
+}
 ```
 
 ### Incremental Indexing with File Watching
@@ -207,6 +241,8 @@ Files with NUL bytes or invalid UTF-8 are skipped.
 
 ## Index Format
 
+### Standard Index (v1)
+
 Binary format inspired by Google Code Search:
 
 ```
@@ -222,6 +258,33 @@ Binary format inspired by Google Code Search:
 │ Trailer (32 bytes + magic)      │  ← section offsets
 └─────────────────────────────────┘
 ```
+
+### Positional Index (v2)
+
+Extended format with position data for proximity queries:
+
+```
+┌─────────────────────────────────┐
+│ Magic Header ("hound idx 2\n")  │
+├─────────────────────────────────┤
+│ Name List                       │  ← file paths, varint-length prefixed
+├─────────────────────────────────┤
+│ Positional Posting Lists        │  ← per file: (file_id, position_count, 
+│                                 │     [(byte_offset, rune_offset)...])
+├─────────────────────────────────┤
+│ Posting Index                   │  ← trigram → (file_count, pos_count, offset)
+├─────────────────────────────────┤
+│ Rune Offset Maps                │  ← per file: sampled byte offsets every 100 runes
+│                                 │     for efficient rune→byte conversion
+├─────────────────────────────────┤
+│ Trailer (48 bytes + magic)      │  ← section offsets
+└─────────────────────────────────┘
+```
+
+Position encoding uses delta compression:
+- File IDs: delta+1 encoded (0 = end marker)
+- Byte/rune offsets: delta from previous position within each file
+- Rune sampling: every 100 runes, inspired by Zoekt's design
 
 The index is opened with `mmap()` for zero-copy access.
 
