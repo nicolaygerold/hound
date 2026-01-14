@@ -5,12 +5,14 @@ Fast text search library with trigram indexing, inspired by [Google Code Search]
 ## Features
 
 - **Trigram indexing** - Fast substring search using 3-character n-grams
+- **Segment-based architecture** - Immutable segments for true incremental updates without full index rebuilds
 - **Positional trigrams** - Store byte/rune offsets where each trigram appears, enabling proximity queries
 - **Regex search** - Filter candidates by extracting trigrams from regex patterns, then verify with full regex match
 - **Parallel search** - Multi-threaded file verification for faster search on multi-core systems
-- **Ranked results** - Files ranked by how many query trigrams match
+- **Ranked results** - Files ranked by how many query trigrams match (BM25 scoring)
 - **Context snippets** - Search results include matching lines with surrounding context, line numbers, and match positions
 - **File watching** - Incremental updates via inotify (Linux) / kqueue (macOS)
+- **Atomic commits** - Crash-safe index updates via meta.json atomic writes
 - **XDG-compliant storage** - Indexes stored in standard cache directories
 - **C API** - Use from Swift, Objective-C, or any C-compatible language
 
@@ -107,7 +109,50 @@ for (results) |file_id| {
 }
 ```
 
-### Incremental Indexing with File Watching
+### Segment-Based Incremental Indexing
+
+The segment-based index allows true incremental updates without rebuilding the entire index:
+
+```zig
+const hound = @import("hound");
+
+// Create or open segment-based index
+var writer = try hound.segment_index.SegmentIndexWriter.init(allocator, "index_dir");
+defer writer.deinit();
+
+// Add files - each commit creates a new immutable segment
+try writer.addFile("src/main.zig", file_content);
+try writer.addFile("src/utils.zig", other_content);
+try writer.commit();  // Creates segment 1
+
+// Add more files later
+try writer.addFile("src/new_feature.zig", new_content);
+try writer.commit();  // Creates segment 2 (segment 1 unchanged)
+
+// Update existing files - old version marked as deleted, new version in new segment
+try writer.addFile("src/main.zig", updated_content);
+try writer.commit();
+
+// Delete files
+try writer.deleteFile("src/old_file.zig");
+try writer.commit();
+
+// Search across all segments
+var reader = try hound.segment_index.SegmentIndexReader.open(allocator, "index_dir");
+defer reader.close();
+
+const tri = hound.trigram.fromBytes('h', 'e', 'l');
+var iter = reader.lookupTrigram(tri);
+const file_ids = try iter.collect(allocator);
+defer allocator.free(file_ids);
+
+for (file_ids) |global_id| {
+    const name = reader.getName(global_id).?;
+    std.debug.print("Found: {s}\n", .{name});
+}
+```
+
+### Legacy Incremental Indexing with File Watching
 
 ```zig
 const hound = @import("hound");
@@ -240,6 +285,42 @@ Defined in [src/trigram.zig](src/trigram.zig):
 Files with NUL bytes or invalid UTF-8 are skipped.
 
 ## Index Format
+
+### Segment-Based Index (v3)
+
+The segment-based architecture stores the index as multiple immutable segments:
+
+```
+index_dir/
+├── meta.json                 ← Atomic commit log, tracks active segments
+└── segments/
+    ├── <segment_id>.seg      ← Individual segment file (v1 format)
+    ├── <segment_id>.del      ← Deletion bitmap (optional)
+    └── ...
+```
+
+**meta.json structure:**
+```json
+{
+  "version": 1,
+  "opstamp": 42,
+  "segments": [
+    {
+      "id": "e9f92d57...",
+      "num_docs": 1000,
+      "num_deleted_docs": 10,
+      "has_deletions": true,
+      "del_gen": 2
+    }
+  ]
+}
+```
+
+Key design principles (inspired by [tantivy](https://github.com/quickwit-oss/tantivy)):
+- **Immutable segments**: Once written, segment files never change
+- **Atomic commits**: Write new segments → fsync → atomic rename meta.json
+- **Deletions via bitmaps**: Files marked as deleted, not removed from segments
+- **Concurrent reads**: Readers snapshot meta.json at open time
 
 ### Standard Index (v1)
 
