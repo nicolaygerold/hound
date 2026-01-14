@@ -2,10 +2,12 @@ const std = @import("std");
 const posix = std.posix;
 const trigram_mod = @import("trigram.zig");
 const reader_mod = @import("reader.zig");
+const regex_mod = @import("regex.zig");
 const Trigram = trigram_mod.Trigram;
 const IndexReader = reader_mod.IndexReader;
 const PostingListView = reader_mod.PostingListView;
 const Extractor = trigram_mod.Extractor;
+const PosixRegex = regex_mod.PosixRegex;
 
 pub const MatchPosition = struct {
     start: usize,
@@ -296,6 +298,212 @@ pub const Searcher = struct {
             self.allocator.free(r.snippets);
         }
         self.allocator.free(results);
+    }
+
+    /// Search using a regex pattern
+    /// Extracts required trigrams from regex to filter candidates, then verifies with full regex match
+    pub fn searchRegex(self: *Searcher, pattern: []const u8, max_results: usize) ![]SearchResult {
+        // Step 1: Extract trigrams from regex pattern
+        const trigrams = try regex_mod.extractTrigrams(self.allocator, pattern);
+        defer self.allocator.free(trigrams);
+
+        // Step 2: Compile the regex for verification
+        var regex = PosixRegex.compile(pattern, self.allocator) catch return &[_]SearchResult{};
+        defer regex.deinit();
+
+        // Step 3: If no trigrams extracted, we must scan all files (expensive)
+        // For now, return empty if no trigrams - could add full scan option later
+        if (trigrams.len == 0) {
+            return self.searchRegexFullScan(&regex, max_results);
+        }
+
+        // Step 4: Look up posting lists for each trigram
+        var posting_lists = std.ArrayList([]u32).init(self.allocator);
+        defer {
+            for (posting_lists.items) |list| self.allocator.free(list);
+            posting_lists.deinit();
+        }
+
+        for (trigrams) |tri| {
+            if (self.reader.lookupTrigram(tri)) |*view| {
+                var v = view.*;
+                const file_ids = try v.collect(self.allocator);
+                try posting_lists.append(file_ids);
+            }
+        }
+
+        if (posting_lists.items.len == 0) return &[_]SearchResult{};
+
+        // Step 5: Intersect and rank candidates
+        const ranked = try self.intersectAndRank(posting_lists.items);
+        defer self.allocator.free(ranked);
+
+        // Step 6: Verify with full regex and extract snippets
+        var results = std.ArrayList(SearchResult).init(self.allocator);
+        errdefer results.deinit();
+
+        for (ranked) |candidate| {
+            if (results.items.len >= max_results) break;
+
+            const name = self.reader.getName(candidate.file_id) orelse continue;
+            if (self.extractRegexSnippets(name, &regex)) |snippets| {
+                try results.append(.{
+                    .file_id = candidate.file_id,
+                    .match_count = @intCast(snippets.len),
+                    .name = name,
+                    .snippets = snippets,
+                });
+            }
+        }
+
+        return results.toOwnedSlice();
+    }
+
+    /// Full scan when no trigrams available (fallback for regex like .* or [a-z]*)
+    fn searchRegexFullScan(self: *Searcher, regex: *const PosixRegex, max_results: usize) ![]SearchResult {
+        var results = std.ArrayList(SearchResult).init(self.allocator);
+        errdefer results.deinit();
+
+        // Iterate through all indexed files
+        var file_id: u32 = 0;
+        while (results.items.len < max_results) : (file_id += 1) {
+            const name = self.reader.getName(file_id) orelse break;
+            if (self.extractRegexSnippets(name, regex)) |snippets| {
+                try results.append(.{
+                    .file_id = file_id,
+                    .match_count = @intCast(snippets.len),
+                    .name = name,
+                    .snippets = snippets,
+                });
+            }
+        }
+
+        return results.toOwnedSlice();
+    }
+
+    /// Extract snippets for regex matches
+    fn extractRegexSnippets(self: *Searcher, path: []const u8, regex: *const PosixRegex) ?[]ContextSnippet {
+        const file = std.fs.cwd().openFile(path, .{}) catch return null;
+        defer file.close();
+
+        const stat = file.stat() catch return null;
+        const size = stat.size;
+        if (size == 0) return null;
+
+        const data = posix.mmap(
+            null,
+            size,
+            posix.PROT.READ,
+            .{ .TYPE = .SHARED },
+            file.handle,
+            0,
+        ) catch return null;
+        defer posix.munmap(data);
+
+        // Build line starts
+        var line_starts = std.ArrayList(usize).init(self.allocator);
+        defer line_starts.deinit();
+        line_starts.append(0) catch return null;
+
+        for (data, 0..) |byte, i| {
+            if (byte == '\n' and i + 1 < data.len) {
+                line_starts.append(i + 1) catch return null;
+            }
+        }
+
+        // Find all regex matches
+        const matches = regex.findAll(data, self.allocator) catch return null;
+        defer self.allocator.free(matches);
+
+        if (matches.len == 0) return null;
+
+        // Group matches by line
+        var match_lines = std.AutoHashMap(u32, std.ArrayList(MatchPosition)).init(self.allocator);
+        defer {
+            var it = match_lines.valueIterator();
+            while (it.next()) |list| list.deinit();
+            match_lines.deinit();
+        }
+
+        for (matches) |m| {
+            const line_num = findLineNumber(line_starts.items, m.start);
+            const line_start = line_starts.items[line_num];
+            const match_in_line = MatchPosition{
+                .start = m.start - line_start,
+                .end = m.end - line_start,
+            };
+
+            const entry = match_lines.getOrPut(line_num) catch return null;
+            if (!entry.found_existing) {
+                entry.value_ptr.* = std.ArrayList(MatchPosition).init(self.allocator);
+            }
+            entry.value_ptr.append(match_in_line) catch return null;
+        }
+
+        // Build context lines
+        var lines_to_include = std.AutoHashMap(u32, void).init(self.allocator);
+        defer lines_to_include.deinit();
+
+        var match_it = match_lines.keyIterator();
+        while (match_it.next()) |line_num_ptr| {
+            const line_num = line_num_ptr.*;
+            const context = self.context_lines;
+            const start_line: u32 = if (line_num >= context) line_num - context else 0;
+            const total_lines: u32 = @intCast(line_starts.items.len);
+            const end_line = @min(line_num + context, total_lines - 1);
+
+            var l = start_line;
+            while (l <= end_line) : (l += 1) {
+                lines_to_include.put(l, {}) catch return null;
+            }
+        }
+
+        // Sort and build snippets
+        var sorted_lines = std.ArrayList(u32).init(self.allocator);
+        defer sorted_lines.deinit();
+        var lines_it = lines_to_include.keyIterator();
+        while (lines_it.next()) |k| {
+            sorted_lines.append(k.*) catch return null;
+        }
+        std.mem.sort(u32, sorted_lines.items, {}, std.sort.asc(u32));
+
+        const max_snippets = @min(sorted_lines.items.len, self.max_snippets_per_file);
+        var snippets = self.allocator.alloc(ContextSnippet, max_snippets) catch return null;
+        errdefer self.allocator.free(snippets);
+
+        var snippet_count: usize = 0;
+        for (sorted_lines.items) |line_num| {
+            if (snippet_count >= max_snippets) break;
+
+            const line_start = line_starts.items[line_num];
+            const line_end = if (line_num + 1 < line_starts.items.len)
+                line_starts.items[line_num + 1] - 1
+            else
+                data.len;
+
+            const line_len = line_end - line_start;
+            const line_content = self.allocator.alloc(u8, line_len) catch return null;
+            @memcpy(line_content, data[line_start..line_end]);
+
+            var match_positions: []MatchPosition = &[_]MatchPosition{};
+            if (match_lines.get(line_num)) |match_list| {
+                match_positions = self.allocator.alloc(MatchPosition, match_list.items.len) catch {
+                    self.allocator.free(line_content);
+                    return null;
+                };
+                @memcpy(match_positions, match_list.items);
+            }
+
+            snippets[snippet_count] = .{
+                .line_number = line_num + 1,
+                .byte_offset = line_start,
+                .line_content = line_content,
+                .matches = match_positions,
+            };
+            snippet_count += 1;
+        }
+
+        return snippets[0..snippet_count];
     }
 };
 
@@ -655,4 +863,168 @@ test "multiple matches on same line" {
     try std.testing.expectEqual(@as(usize, 0), snippet.matches[0].start);
     try std.testing.expectEqual(@as(usize, 8), snippet.matches[1].start);
     try std.testing.expectEqual(@as(usize, 16), snippet.matches[2].start);
+}
+
+test "regex search basic" {
+    const allocator = std.testing.allocator;
+    const test_path = "/tmp/hound_regex_test.idx";
+    const test_dir = "/tmp/hound_regex_files";
+    const index = @import("index.zig");
+
+    std.fs.cwd().deleteTree(test_dir) catch {};
+    try std.fs.cwd().makePath(test_dir);
+
+    const files = .{
+        .{ "hello.txt", "hello world" },
+        .{ "world.txt", "world peace" },
+        .{ "numbers.txt", "foo123bar" },
+    };
+
+    inline for (files) |f| {
+        const file = try std.fs.cwd().createFile(test_dir ++ "/" ++ f[0], .{});
+        defer file.close();
+        try file.writeAll(f[1]);
+    }
+
+    {
+        var writer = try index.IndexWriter.init(allocator, test_path);
+        defer writer.deinit();
+
+        inline for (files) |f| {
+            try writer.addFile(test_dir ++ "/" ++ f[0], f[1]);
+        }
+        try writer.finish();
+    }
+
+    var reader_inst = try IndexReader.open(allocator, test_path);
+    defer reader_inst.close();
+
+    var searcher = try Searcher.init(allocator, &reader_inst);
+    defer searcher.deinit();
+
+    // Simple literal regex
+    const results = try searcher.searchRegex("hello", 10);
+    defer searcher.freeResults(results);
+
+    try std.testing.expect(results.len >= 1);
+}
+
+test "regex search with pattern" {
+    const allocator = std.testing.allocator;
+    const test_path = "/tmp/hound_regex_pattern_test.idx";
+    const test_dir = "/tmp/hound_regex_pattern_files";
+    const index = @import("index.zig");
+
+    std.fs.cwd().deleteTree(test_dir) catch {};
+    try std.fs.cwd().makePath(test_dir);
+
+    const content = "foo123bar baz456qux";
+
+    {
+        const file = try std.fs.cwd().createFile(test_dir ++ "/nums.txt", .{});
+        defer file.close();
+        try file.writeAll(content);
+    }
+
+    {
+        var writer = try index.IndexWriter.init(allocator, test_path);
+        defer writer.deinit();
+        try writer.addFile(test_dir ++ "/nums.txt", content);
+        try writer.finish();
+    }
+
+    var reader_inst = try IndexReader.open(allocator, test_path);
+    defer reader_inst.close();
+
+    var searcher = try Searcher.init(allocator, &reader_inst);
+    defer searcher.deinit();
+
+    // Regex with numbers
+    const results = try searcher.searchRegex("foo[0-9]+bar", 10);
+    defer searcher.freeResults(results);
+
+    try std.testing.expectEqual(@as(usize, 1), results.len);
+    try std.testing.expect(results[0].snippets.len > 0);
+}
+
+test "regex search alternation" {
+    const allocator = std.testing.allocator;
+    const test_path = "/tmp/hound_regex_alt_test.idx";
+    const test_dir = "/tmp/hound_regex_alt_files";
+    const index = @import("index.zig");
+
+    std.fs.cwd().deleteTree(test_dir) catch {};
+    try std.fs.cwd().makePath(test_dir);
+
+    const files = .{
+        .{ "abc.txt", "abcdef" },
+        .{ "ghi.txt", "abcghi" },
+        .{ "xyz.txt", "xyzabc" },
+    };
+
+    inline for (files) |f| {
+        const file = try std.fs.cwd().createFile(test_dir ++ "/" ++ f[0], .{});
+        defer file.close();
+        try file.writeAll(f[1]);
+    }
+
+    {
+        var writer = try index.IndexWriter.init(allocator, test_path);
+        defer writer.deinit();
+
+        inline for (files) |f| {
+            try writer.addFile(test_dir ++ "/" ++ f[0], f[1]);
+        }
+        try writer.finish();
+    }
+
+    var reader_inst = try IndexReader.open(allocator, test_path);
+    defer reader_inst.close();
+
+    var searcher = try Searcher.init(allocator, &reader_inst);
+    defer searcher.deinit();
+
+    // Search for abc followed by def or ghi
+    const results = try searcher.searchRegex("abc(def|ghi)", 10);
+    defer searcher.freeResults(results);
+
+    // Should match abc.txt and ghi.txt but not xyz.txt (abc at end)
+    try std.testing.expectEqual(@as(usize, 2), results.len);
+}
+
+test "regex search with quantifiers" {
+    const allocator = std.testing.allocator;
+    const test_path = "/tmp/hound_regex_quant_test.idx";
+    const test_dir = "/tmp/hound_regex_quant_files";
+    const index = @import("index.zig");
+
+    std.fs.cwd().deleteTree(test_dir) catch {};
+    try std.fs.cwd().makePath(test_dir);
+
+    const content = "hellooooo world";
+
+    {
+        const file = try std.fs.cwd().createFile(test_dir ++ "/oooo.txt", .{});
+        defer file.close();
+        try file.writeAll(content);
+    }
+
+    {
+        var writer = try index.IndexWriter.init(allocator, test_path);
+        defer writer.deinit();
+        try writer.addFile(test_dir ++ "/oooo.txt", content);
+        try writer.finish();
+    }
+
+    var reader_inst = try IndexReader.open(allocator, test_path);
+    defer reader_inst.close();
+
+    var searcher = try Searcher.init(allocator, &reader_inst);
+    defer searcher.deinit();
+
+    // + quantifier
+    const results = try searcher.searchRegex("hello+", 10);
+    defer searcher.freeResults(results);
+
+    try std.testing.expectEqual(@as(usize, 1), results.len);
 }

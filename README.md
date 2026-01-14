@@ -5,7 +5,9 @@ Fast text search library with trigram indexing, inspired by [Google Code Search]
 ## Features
 
 - **Trigram indexing** - Fast substring search using 3-character n-grams
+- **Regex search** - Filter candidates by extracting trigrams from regex patterns, then verify with full regex match
 - **Ranked results** - Files ranked by how many query trigrams match
+- **Context snippets** - Search results include matching lines with surrounding context, line numbers, and match positions
 - **File watching** - Incremental updates via inotify (Linux) / kqueue (macOS)
 - **XDG-compliant storage** - Indexes stored in standard cache directories
 - **C API** - Use from Swift, Objective-C, or any C-compatible language
@@ -42,11 +44,23 @@ defer reader.close();
 var searcher = try hound.search.Searcher.init(allocator, &reader);
 defer searcher.deinit();
 
+// Substring search
 const results = try searcher.search("handleRequest", 10);
 defer searcher.freeResults(results);
 
 for (results) |r| {
     std.debug.print("{s}: {d} matches\n", .{ r.name, r.match_count });
+    for (r.snippets) |snippet| {
+        std.debug.print("  L{d}: {s}\n", .{ snippet.line_number, snippet.line_content });
+    }
+}
+
+// Regex search
+const regex_results = try searcher.searchRegex("handle[A-Z][a-z]+", 10);
+defer searcher.freeResults(regex_results);
+
+for (regex_results) |r| {
+    std.debug.print("{s}: {d} regex matches\n", .{ r.name, r.match_count });
 }
 ```
 
