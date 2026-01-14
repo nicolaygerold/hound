@@ -62,7 +62,7 @@ pub const InotifyBackend = struct {
     name_buf: std.ArrayList(u8),
 
     pub fn init(allocator: Allocator) !InotifyBackend {
-        const inotify_fd = try posix.inotify_init1(.{ .NONBLOCK = true, .CLOEXEC = true });
+        const inotify_fd = try posix.inotify_init1(linux.IN.NONBLOCK | linux.IN.CLOEXEC);
         errdefer posix.close(inotify_fd);
 
         return .{
