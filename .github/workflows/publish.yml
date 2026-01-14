@@ -43,15 +43,33 @@ jobs:
           name: ${{ matrix.binary }}
           path: zig-out/bin/hound
 
+  xcframework:
+    runs-on: macos-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: mlugg/setup-zig@v1
+        with:
+          version: ${{ env.ZIG_VERSION }}
+
+      - name: Build XCFramework
+        run: ./scripts/build-xcframework.sh ${{ github.ref_name }}
+
+      - name: Upload XCFramework
+        uses: actions/upload-artifact@v4
+        with:
+          name: CHound.xcframework
+          path: release/CHound.xcframework.zip
+
   publish:
-    needs: build
+    needs: [build, xcframework]
     runs-on: ubuntu-latest
     permissions:
       contents: write
     steps:
       - uses: actions/checkout@v4
 
-      - name: Download all binaries
+      - name: Download all artifacts
         uses: actions/download-artifact@v4
         with:
           path: artifacts
@@ -71,3 +89,9 @@ jobs:
             tar -czvf $bin.tar.gz $bin.bin
             gh release upload ${{ github.ref_name }} $bin.tar.gz
           done
+
+      - name: Upload XCFramework to release
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          gh release upload ${{ github.ref_name }} artifacts/CHound.xcframework/CHound.xcframework.zip
