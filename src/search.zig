@@ -28,11 +28,19 @@ pub const SearchResult = struct {
     snippets: []ContextSnippet,
 };
 
+pub const RankingMode = enum {
+    trigram_count,
+    bm25,
+};
+
 pub const SearchOptions = struct {
     max_results: usize = 100,
     context_lines: u32 = 2,
     max_snippets_per_file: u32 = 10,
     thread_count: u32 = 0,
+    ranking_mode: RankingMode = .bm25,
+    bm25_k1: f64 = 1.2,
+    bm25_b: f64 = 0.75,
 };
 
 const VerifyTask = struct {
@@ -68,6 +76,9 @@ pub const Searcher = struct {
     context_lines: u32,
     max_snippets_per_file: u32,
     thread_count: u32,
+    ranking_mode: RankingMode,
+    bm25_k1: f64,
+    bm25_b: f64,
 
     pub fn init(allocator: std.mem.Allocator, reader: *IndexReader) !Searcher {
         return initWithOptions(allocator, reader, .{});
@@ -84,6 +95,9 @@ pub const Searcher = struct {
             .context_lines = options.context_lines,
             .max_snippets_per_file = options.max_snippets_per_file,
             .thread_count = thread_count,
+            .ranking_mode = options.ranking_mode,
+            .bm25_k1 = options.bm25_k1,
+            .bm25_b = options.bm25_b,
         };
     }
 
@@ -105,17 +119,24 @@ pub const Searcher = struct {
             posting_lists.deinit();
         }
 
+        var posting_list_sizes = std.ArrayList(u32).init(self.allocator);
+        defer posting_list_sizes.deinit();
+
         for (trigrams) |tri| {
             if (self.reader.lookupTrigram(tri)) |*view| {
                 var v = view.*;
                 const file_ids = try v.collect(self.allocator);
+                try posting_list_sizes.append(@intCast(file_ids.len));
                 try posting_lists.append(file_ids);
             }
         }
 
         if (posting_lists.items.len == 0) return &[_]SearchResult{};
 
-        const ranked = try self.intersectAndRank(posting_lists.items);
+        const ranked = switch (self.ranking_mode) {
+            .trigram_count => try self.intersectAndRank(posting_lists.items),
+            .bm25 => try self.intersectAndRankBM25(posting_lists.items, posting_list_sizes.items),
+        };
         defer self.allocator.free(ranked);
 
         return self.verifyFilesParallel(ranked, query, max_results);
@@ -403,6 +424,91 @@ pub const Searcher = struct {
             try result.append(.{
                 .file_id = entry.key_ptr.*,
                 .count = entry.value_ptr.*,
+            });
+        }
+
+        std.mem.sort(FileCount, result.items, {}, struct {
+            fn cmp(_: void, a: FileCount, b: FileCount) bool {
+                if (a.count != b.count) return a.count > b.count;
+                return a.file_id < b.file_id;
+            }
+        }.cmp);
+
+        return result.toOwnedSlice();
+    }
+
+    fn intersectAndRankBM25(self: *Searcher, lists: [][]u32, posting_list_sizes: []u32) ![]FileCount {
+        const total_docs: f64 = @floatFromInt(self.reader.nameCount());
+        if (total_docs == 0) return &[_]FileCount{};
+
+        const avg_doc_length: f64 = @as(f64, @floatFromInt(lists.len));
+
+        var tf_map = std.AutoHashMap(u32, std.ArrayList(u32)).init(self.allocator);
+        defer {
+            var vit = tf_map.valueIterator();
+            while (vit.next()) |list| list.deinit();
+            tf_map.deinit();
+        }
+
+        for (lists, 0..) |list, term_idx| {
+            for (list) |file_id| {
+                const entry = try tf_map.getOrPut(file_id);
+                if (!entry.found_existing) {
+                    entry.value_ptr.* = std.ArrayList(u32).init(self.allocator);
+                }
+                try entry.value_ptr.append(@intCast(term_idx));
+            }
+        }
+
+        var idf_values = try self.allocator.alloc(f64, lists.len);
+        defer self.allocator.free(idf_values);
+
+        for (posting_list_sizes, 0..) |doc_freq, i| {
+            const df: f64 = @floatFromInt(doc_freq);
+            idf_values[i] = @log((total_docs - df + 0.5) / (df + 0.5) + 1.0);
+        }
+
+        var scores = std.AutoHashMap(u32, f64).init(self.allocator);
+        defer scores.deinit();
+
+        var tf_it = tf_map.iterator();
+        while (tf_it.next()) |entry| {
+            const file_id = entry.key_ptr.*;
+            const term_indices = entry.value_ptr.items;
+
+            var term_freqs = try self.allocator.alloc(u32, lists.len);
+            defer self.allocator.free(term_freqs);
+            @memset(term_freqs, 0);
+
+            for (term_indices) |term_idx| {
+                term_freqs[term_idx] += 1;
+            }
+
+            const doc_length: f64 = @floatFromInt(term_indices.len);
+            const length_norm = 1.0 - self.bm25_b + self.bm25_b * (doc_length / avg_doc_length);
+
+            var score: f64 = 0.0;
+            for (term_freqs, 0..) |tf, term_idx| {
+                if (tf > 0) {
+                    const tf_f: f64 = @floatFromInt(tf);
+                    const numerator = tf_f * (self.bm25_k1 + 1.0);
+                    const denominator = tf_f + self.bm25_k1 * length_norm;
+                    score += idf_values[term_idx] * (numerator / denominator);
+                }
+            }
+
+            try scores.put(file_id, score);
+        }
+
+        var result = std.ArrayList(FileCount).init(self.allocator);
+        errdefer result.deinit();
+
+        var score_it = scores.iterator();
+        while (score_it.next()) |entry| {
+            const score_u32: u32 = @intFromFloat(@max(0.0, entry.value_ptr.* * 1000.0));
+            try result.append(.{
+                .file_id = entry.key_ptr.*,
+                .count = score_u32,
             });
         }
 
@@ -1604,4 +1710,297 @@ test "single threaded fallback for small candidate sets" {
     defer searcher.freeResults(results);
 
     try std.testing.expectEqual(@as(usize, 1), results.len);
+}
+
+test "bm25 ranking basic" {
+    const allocator = std.testing.allocator;
+    const test_path = "/tmp/hound_bm25_basic_test.idx";
+    const test_dir = "/tmp/hound_bm25_basic_files";
+    const index = @import("index.zig");
+
+    std.fs.cwd().deleteTree(test_dir) catch {};
+    try std.fs.cwd().makePath(test_dir);
+
+    {
+        const file = try std.fs.cwd().createFile(test_dir ++ "/doc1.txt", .{});
+        defer file.close();
+        try file.writeAll("hello world hello hello");
+    }
+    {
+        const file = try std.fs.cwd().createFile(test_dir ++ "/doc2.txt", .{});
+        defer file.close();
+        try file.writeAll("hello there friend");
+    }
+    {
+        const file = try std.fs.cwd().createFile(test_dir ++ "/doc3.txt", .{});
+        defer file.close();
+        try file.writeAll("goodbye world");
+    }
+
+    {
+        var writer = try index.IndexWriter.init(allocator, test_path);
+        defer writer.deinit();
+        try writer.addFile(test_dir ++ "/doc1.txt", "hello world hello hello");
+        try writer.addFile(test_dir ++ "/doc2.txt", "hello there friend");
+        try writer.addFile(test_dir ++ "/doc3.txt", "goodbye world");
+        try writer.finish();
+    }
+
+    var reader_inst = try IndexReader.open(allocator, test_path);
+    defer reader_inst.close();
+
+    var searcher = try Searcher.initWithOptions(allocator, &reader_inst, .{ .ranking_mode = .bm25 });
+    defer searcher.deinit();
+
+    const results = try searcher.search("hello", 10);
+    defer searcher.freeResults(results);
+
+    try std.testing.expect(results.len >= 2);
+}
+
+test "bm25 vs trigram_count mode switch" {
+    const allocator = std.testing.allocator;
+    const test_path = "/tmp/hound_bm25_mode_test.idx";
+    const test_dir = "/tmp/hound_bm25_mode_files";
+    const index = @import("index.zig");
+
+    std.fs.cwd().deleteTree(test_dir) catch {};
+    try std.fs.cwd().makePath(test_dir);
+
+    {
+        const file = try std.fs.cwd().createFile(test_dir ++ "/a.txt", .{});
+        defer file.close();
+        try file.writeAll("searchterm here");
+    }
+    {
+        const file = try std.fs.cwd().createFile(test_dir ++ "/b.txt", .{});
+        defer file.close();
+        try file.writeAll("searchterm there too");
+    }
+
+    {
+        var writer = try index.IndexWriter.init(allocator, test_path);
+        defer writer.deinit();
+        try writer.addFile(test_dir ++ "/a.txt", "searchterm here");
+        try writer.addFile(test_dir ++ "/b.txt", "searchterm there too");
+        try writer.finish();
+    }
+
+    var reader_inst = try IndexReader.open(allocator, test_path);
+    defer reader_inst.close();
+
+    {
+        var searcher_bm25 = try Searcher.initWithOptions(allocator, &reader_inst, .{ .ranking_mode = .bm25 });
+        defer searcher_bm25.deinit();
+
+        const results = try searcher_bm25.search("searchterm", 10);
+        defer searcher_bm25.freeResults(results);
+
+        try std.testing.expectEqual(@as(usize, 2), results.len);
+    }
+
+    {
+        var searcher_count = try Searcher.initWithOptions(allocator, &reader_inst, .{ .ranking_mode = .trigram_count });
+        defer searcher_count.deinit();
+
+        const results = try searcher_count.search("searchterm", 10);
+        defer searcher_count.freeResults(results);
+
+        try std.testing.expectEqual(@as(usize, 2), results.len);
+    }
+}
+
+test "bm25 idf favors rare terms" {
+    const allocator = std.testing.allocator;
+    const test_path = "/tmp/hound_bm25_idf_test.idx";
+    const test_dir = "/tmp/hound_bm25_idf_files";
+    const index = @import("index.zig");
+
+    std.fs.cwd().deleteTree(test_dir) catch {};
+    try std.fs.cwd().makePath(test_dir);
+
+    {
+        const file = try std.fs.cwd().createFile(test_dir ++ "/common1.txt", .{});
+        defer file.close();
+        try file.writeAll("common word here");
+    }
+    {
+        const file = try std.fs.cwd().createFile(test_dir ++ "/common2.txt", .{});
+        defer file.close();
+        try file.writeAll("common word there");
+    }
+    {
+        const file = try std.fs.cwd().createFile(test_dir ++ "/common3.txt", .{});
+        defer file.close();
+        try file.writeAll("common word everywhere");
+    }
+    {
+        const file = try std.fs.cwd().createFile(test_dir ++ "/rare.txt", .{});
+        defer file.close();
+        try file.writeAll("common uniqueterm special");
+    }
+
+    {
+        var writer = try index.IndexWriter.init(allocator, test_path);
+        defer writer.deinit();
+        try writer.addFile(test_dir ++ "/common1.txt", "common word here");
+        try writer.addFile(test_dir ++ "/common2.txt", "common word there");
+        try writer.addFile(test_dir ++ "/common3.txt", "common word everywhere");
+        try writer.addFile(test_dir ++ "/rare.txt", "common uniqueterm special");
+        try writer.finish();
+    }
+
+    var reader_inst = try IndexReader.open(allocator, test_path);
+    defer reader_inst.close();
+
+    var searcher = try Searcher.initWithOptions(allocator, &reader_inst, .{ .ranking_mode = .bm25 });
+    defer searcher.deinit();
+
+    const results = try searcher.search("uniqueterm", 10);
+    defer searcher.freeResults(results);
+
+    try std.testing.expectEqual(@as(usize, 1), results.len);
+    try std.testing.expect(std.mem.indexOf(u8, results[0].name, "rare.txt") != null);
+}
+
+test "bm25 multi-term query ranking" {
+    const allocator = std.testing.allocator;
+    const test_path = "/tmp/hound_bm25_multi_test.idx";
+    const test_dir = "/tmp/hound_bm25_multi_files";
+    const index = @import("index.zig");
+
+    std.fs.cwd().deleteTree(test_dir) catch {};
+    try std.fs.cwd().makePath(test_dir);
+
+    {
+        const file = try std.fs.cwd().createFile(test_dir ++ "/both.txt", .{});
+        defer file.close();
+        try file.writeAll("alpha beta gamma");
+    }
+    {
+        const file = try std.fs.cwd().createFile(test_dir ++ "/alpha_only.txt", .{});
+        defer file.close();
+        try file.writeAll("alpha delta epsilon");
+    }
+    {
+        const file = try std.fs.cwd().createFile(test_dir ++ "/beta_only.txt", .{});
+        defer file.close();
+        try file.writeAll("beta zeta theta");
+    }
+
+    {
+        var writer = try index.IndexWriter.init(allocator, test_path);
+        defer writer.deinit();
+        try writer.addFile(test_dir ++ "/both.txt", "alpha beta gamma");
+        try writer.addFile(test_dir ++ "/alpha_only.txt", "alpha delta epsilon");
+        try writer.addFile(test_dir ++ "/beta_only.txt", "beta zeta theta");
+        try writer.finish();
+    }
+
+    var reader_inst = try IndexReader.open(allocator, test_path);
+    defer reader_inst.close();
+
+    var searcher = try Searcher.initWithOptions(allocator, &reader_inst, .{ .ranking_mode = .bm25 });
+    defer searcher.deinit();
+
+    const results = try searcher.search("alpha beta", 10);
+    defer searcher.freeResults(results);
+
+    try std.testing.expect(results.len >= 1);
+    try std.testing.expect(std.mem.indexOf(u8, results[0].name, "both.txt") != null);
+}
+
+test "bm25 custom k1 and b parameters" {
+    const allocator = std.testing.allocator;
+    const test_path = "/tmp/hound_bm25_params_test.idx";
+    const test_dir = "/tmp/hound_bm25_params_files";
+    const index = @import("index.zig");
+
+    std.fs.cwd().deleteTree(test_dir) catch {};
+    try std.fs.cwd().makePath(test_dir);
+
+    {
+        const file = try std.fs.cwd().createFile(test_dir ++ "/doc.txt", .{});
+        defer file.close();
+        try file.writeAll("parameter test content");
+    }
+
+    {
+        var writer = try index.IndexWriter.init(allocator, test_path);
+        defer writer.deinit();
+        try writer.addFile(test_dir ++ "/doc.txt", "parameter test content");
+        try writer.finish();
+    }
+
+    var reader_inst = try IndexReader.open(allocator, test_path);
+    defer reader_inst.close();
+
+    var searcher = try Searcher.initWithOptions(allocator, &reader_inst, .{
+        .ranking_mode = .bm25,
+        .bm25_k1 = 2.0,
+        .bm25_b = 0.5,
+    });
+    defer searcher.deinit();
+
+    const results = try searcher.search("parameter", 10);
+    defer searcher.freeResults(results);
+
+    try std.testing.expectEqual(@as(usize, 1), results.len);
+}
+
+test "bm25 empty index" {
+    const allocator = std.testing.allocator;
+    const test_path = "/tmp/hound_bm25_empty_test.idx";
+    const index = @import("index.zig");
+
+    {
+        var writer = try index.IndexWriter.init(allocator, test_path);
+        defer writer.deinit();
+        try writer.finish();
+    }
+
+    var reader_inst = try IndexReader.open(allocator, test_path);
+    defer reader_inst.close();
+
+    var searcher = try Searcher.initWithOptions(allocator, &reader_inst, .{ .ranking_mode = .bm25 });
+    defer searcher.deinit();
+
+    const results = try searcher.search("anything", 10);
+    defer searcher.freeResults(results);
+
+    try std.testing.expectEqual(@as(usize, 0), results.len);
+}
+
+test "bm25 no matching trigrams" {
+    const allocator = std.testing.allocator;
+    const test_path = "/tmp/hound_bm25_nomatch_test.idx";
+    const test_dir = "/tmp/hound_bm25_nomatch_files";
+    const index = @import("index.zig");
+
+    std.fs.cwd().deleteTree(test_dir) catch {};
+    try std.fs.cwd().makePath(test_dir);
+
+    {
+        const file = try std.fs.cwd().createFile(test_dir ++ "/doc.txt", .{});
+        defer file.close();
+        try file.writeAll("hello world");
+    }
+
+    {
+        var writer = try index.IndexWriter.init(allocator, test_path);
+        defer writer.deinit();
+        try writer.addFile(test_dir ++ "/doc.txt", "hello world");
+        try writer.finish();
+    }
+
+    var reader_inst = try IndexReader.open(allocator, test_path);
+    defer reader_inst.close();
+
+    var searcher = try Searcher.initWithOptions(allocator, &reader_inst, .{ .ranking_mode = .bm25 });
+    defer searcher.deinit();
+
+    const results = try searcher.search("zzzzz", 10);
+    defer searcher.freeResults(results);
+
+    try std.testing.expectEqual(@as(usize, 0), results.len);
 }
