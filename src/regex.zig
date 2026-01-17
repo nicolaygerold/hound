@@ -149,36 +149,37 @@ pub const MatchRange = struct {
 
 /// POSIX regex wrapper for actual matching
 pub const PosixRegex = struct {
-    regex: posix_regex.regex_t,
-    valid: bool,
+    regex: *posix_regex.regex_t,
+    alloc: std.mem.Allocator,
 
     pub fn compile(pattern: []const u8, allocator: std.mem.Allocator) !PosixRegex {
         const pattern_z = try allocator.dupeZ(u8, pattern);
         defer allocator.free(pattern_z);
 
-        var regex: posix_regex.regex_t = undefined;
+        const regex = try allocator.create(posix_regex.regex_t);
+        errdefer allocator.destroy(regex);
+
         const flags: c_int = posix_regex.REG_EXTENDED | posix_regex.REG_NEWLINE;
-        const result = posix_regex.regcomp(&regex, pattern_z.ptr, flags);
+        const result = posix_regex.regcomp(regex, pattern_z.ptr, flags);
 
         if (result != 0) {
+            allocator.destroy(regex);
             return error.InvalidRegex;
         }
 
-        return .{ .regex = regex, .valid = true };
+        return .{ .regex = regex, .alloc = allocator };
     }
 
     pub fn deinit(self: *PosixRegex) void {
-        if (self.valid) {
-            posix_regex.regfree(&self.regex);
-            self.valid = false;
-        }
+        posix_regex.regfree(self.regex);
+        self.alloc.destroy(self.regex);
     }
 
     pub fn match(self: *const PosixRegex, text: []const u8, allocator: std.mem.Allocator) !bool {
         const text_z = try allocator.dupeZ(u8, text);
         defer allocator.free(text_z);
 
-        const result = posix_regex.regexec(&self.regex, text_z.ptr, 0, null, 0);
+        const result = posix_regex.regexec(self.regex, text_z.ptr, 0, null, 0);
         return result == 0;
     }
 
@@ -194,7 +195,7 @@ pub const PosixRegex = struct {
         var offset: usize = 0;
 
         while (offset < text.len) {
-            const result = posix_regex.regexec(&self.regex, text_z.ptr + offset, 1, &pmatch, 0);
+            const result = posix_regex.regexec(self.regex, text_z.ptr + offset, 1, &pmatch, 0);
             if (result != 0) break;
 
             const start = offset + @as(usize, @intCast(pmatch[0].rm_so));
