@@ -29,7 +29,7 @@ pub const StateTracker = struct {
         return .{
             .allocator = allocator,
             .states = std.StringHashMap(FileState).init(allocator),
-            .pending_changes = std.ArrayList(FileChange).init(allocator),
+            .pending_changes = std.ArrayList(FileChange){},
         };
     }
 
@@ -43,7 +43,7 @@ pub const StateTracker = struct {
         for (self.pending_changes.items) |change| {
             self.allocator.free(change.path);
         }
-        self.pending_changes.deinit();
+        self.pending_changes.deinit(self.allocator);
     }
 
     pub fn scanDirectory(self: *StateTracker, dir_path: []const u8) !void {
@@ -64,7 +64,7 @@ pub const StateTracker = struct {
         while (it.next()) |entry| {
             if (!seen.contains(entry.key_ptr.*)) {
                 const path_copy = try self.allocator.dupe(u8, entry.key_ptr.*);
-                try self.pending_changes.append(.{
+                try self.pending_changes.append(self.allocator, .{
                     .path = path_copy,
                     .change_type = .deleted,
                     .old_file_id = entry.value_ptr.file_id,
@@ -112,7 +112,7 @@ pub const StateTracker = struct {
         if (self.states.get(full_path)) |existing| {
             if (existing.mtime != stat.mtime or existing.size != stat.size) {
                 const change_path = try self.allocator.dupe(u8, full_path);
-                try self.pending_changes.append(.{
+                try self.pending_changes.append(self.allocator, .{
                     .path = change_path,
                     .change_type = .modified,
                     .old_file_id = existing.file_id,
@@ -133,7 +133,7 @@ pub const StateTracker = struct {
             }
         } else {
             const change_path = try self.allocator.dupe(u8, full_path);
-            try self.pending_changes.append(.{
+            try self.pending_changes.append(self.allocator, .{
                 .path = change_path,
                 .change_type = .added,
                 .old_file_id = null,
@@ -181,7 +181,7 @@ test "state tracker basic" {
     var tracker = StateTracker.init(allocator);
     defer tracker.deinit();
 
-    const tmp_dir = "/tmp/hound_state_test";
+    const tmp_dir = "/tmp/hound_state_tracker_test";
     std.fs.cwd().deleteTree(tmp_dir) catch {};
     try std.fs.cwd().makeDir(tmp_dir);
     defer std.fs.cwd().deleteTree(tmp_dir) catch {};
@@ -211,7 +211,7 @@ test "state tracker detects modifications" {
     var tracker = StateTracker.init(allocator);
     defer tracker.deinit();
 
-    const tmp_dir = "/tmp/hound_state_mod_test";
+    const tmp_dir = "/tmp/hound_state_modified_test";
     std.fs.cwd().deleteTree(tmp_dir) catch {};
     try std.fs.cwd().makeDir(tmp_dir);
     defer std.fs.cwd().deleteTree(tmp_dir) catch {};
@@ -226,7 +226,7 @@ test "state tracker detects modifications" {
     try tracker.scanDirectory(tmp_dir);
     tracker.clearChanges();
 
-    std.time.sleep(10 * std.time.ns_per_ms);
+    std.Thread.sleep(10 * std.time.ns_per_ms);
 
     {
         const file = try std.fs.cwd().openFile(file_path, .{ .mode = .write_only });
@@ -246,7 +246,7 @@ test "state tracker detects deletions" {
     var tracker = StateTracker.init(allocator);
     defer tracker.deinit();
 
-    const tmp_dir = "/tmp/hound_state_del_test";
+    const tmp_dir = "/tmp/hound_state_deleted_test";
     std.fs.cwd().deleteTree(tmp_dir) catch {};
     try std.fs.cwd().makeDir(tmp_dir);
     defer std.fs.cwd().deleteTree(tmp_dir) catch {};

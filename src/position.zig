@@ -18,17 +18,17 @@ pub const FilePositions = struct {
     pub fn init(allocator: std.mem.Allocator, file_id: u32) FilePositions {
         return .{
             .file_id = file_id,
-            .positions = std.ArrayList(TrigramPosition).init(allocator),
+            .positions = std.ArrayList(TrigramPosition){},
             .allocator = allocator,
         };
     }
 
     pub fn deinit(self: *FilePositions) void {
-        self.positions.deinit();
+        self.positions.deinit(self.allocator);
     }
 
     pub fn addPosition(self: *FilePositions, byte_offset: u32, rune_offset: u32) !void {
-        try self.positions.append(.{
+        try self.positions.append(self.allocator, .{
             .byte_offset = byte_offset,
             .rune_offset = rune_offset,
         });
@@ -44,7 +44,7 @@ pub const PositionalPostingList = struct {
     pub fn init(allocator: std.mem.Allocator, tri: Trigram) PositionalPostingList {
         return .{
             .tri = tri,
-            .file_positions = std.ArrayList(*FilePositions).init(allocator),
+            .file_positions = std.ArrayList(*FilePositions){},
             .file_map = std.AutoHashMap(u32, usize).init(allocator),
             .allocator = allocator,
         };
@@ -55,7 +55,7 @@ pub const PositionalPostingList = struct {
             fp.deinit();
             self.allocator.destroy(fp);
         }
-        self.file_positions.deinit();
+        self.file_positions.deinit(self.allocator);
         self.file_map.deinit();
     }
 
@@ -65,7 +65,7 @@ pub const PositionalPostingList = struct {
             const fp = try self.allocator.create(FilePositions);
             fp.* = FilePositions.init(self.allocator, file_id);
             entry.value_ptr.* = self.file_positions.items.len;
-            try self.file_positions.append(fp);
+            try self.file_positions.append(self.allocator, fp);
         }
         try self.file_positions.items[entry.value_ptr.*].addPosition(byte_offset, rune_offset);
     }
@@ -87,11 +87,11 @@ pub const PositionalPostingList = struct {
     }
 
     pub fn encodeDelta(self: *const PositionalPostingList, allocator: std.mem.Allocator) ![]u8 {
-        var buf = std.ArrayList(u8).init(allocator);
-        errdefer buf.deinit();
+        var buf = std.ArrayList(u8){};
+        errdefer buf.deinit(allocator);
 
         const tri_bytes = trigram_mod.toBytes(self.tri);
-        try buf.appendSlice(&tri_bytes);
+        try buf.appendSlice(allocator, &tri_bytes);
 
         var tmp: [10]u8 = undefined;
         var prev_file_id: u32 = 0;
@@ -99,10 +99,10 @@ pub const PositionalPostingList = struct {
         for (self.file_positions.items) |fp| {
             const file_delta = fp.file_id - prev_file_id;
             var n = varint.encode(file_delta + 1, &tmp);
-            try buf.appendSlice(tmp[0..n]);
+            try buf.appendSlice(allocator, tmp[0..n]);
 
             n = varint.encode(fp.positions.items.len, &tmp);
-            try buf.appendSlice(tmp[0..n]);
+            try buf.appendSlice(allocator, tmp[0..n]);
 
             var prev_byte_offset: u32 = 0;
             var prev_rune_offset: u32 = 0;
@@ -112,10 +112,10 @@ pub const PositionalPostingList = struct {
                 const rune_delta = pos.rune_offset - prev_rune_offset;
 
                 n = varint.encode(byte_delta, &tmp);
-                try buf.appendSlice(tmp[0..n]);
+                try buf.appendSlice(allocator, tmp[0..n]);
 
                 n = varint.encode(rune_delta, &tmp);
-                try buf.appendSlice(tmp[0..n]);
+                try buf.appendSlice(allocator, tmp[0..n]);
 
                 prev_byte_offset = pos.byte_offset;
                 prev_rune_offset = pos.rune_offset;
@@ -125,9 +125,9 @@ pub const PositionalPostingList = struct {
         }
 
         const n = varint.encode(0, &tmp);
-        try buf.appendSlice(tmp[0..n]);
+        try buf.appendSlice(allocator, tmp[0..n]);
 
-        return buf.toOwnedSlice();
+        return buf.toOwnedSlice(allocator);
     }
 };
 
@@ -207,13 +207,13 @@ pub const RuneOffsetSampler = struct {
 
     pub fn init(allocator: std.mem.Allocator) RuneOffsetSampler {
         return .{
-            .samples = std.ArrayList(RuneSample).init(allocator),
+            .samples = std.ArrayList(RuneSample){},
             .allocator = allocator,
         };
     }
 
     pub fn deinit(self: *RuneOffsetSampler) void {
-        self.samples.deinit();
+        self.samples.deinit(self.allocator);
     }
 
     pub fn reset(self: *RuneOffsetSampler) void {
@@ -222,7 +222,7 @@ pub const RuneOffsetSampler = struct {
 
     pub fn sample(self: *RuneOffsetSampler, rune_offset: u32, byte_offset: u32) !void {
         if (rune_offset % RUNE_SAMPLE_FREQUENCY == 0) {
-            try self.samples.append(.{
+            try self.samples.append(self.allocator, .{
                 .rune_offset = rune_offset,
                 .byte_offset = byte_offset,
             });
@@ -250,22 +250,22 @@ pub const RuneOffsetSampler = struct {
     }
 
     pub fn encode(self: *const RuneOffsetSampler, allocator: std.mem.Allocator) ![]u8 {
-        var buf = std.ArrayList(u8).init(allocator);
-        errdefer buf.deinit();
+        var buf = std.ArrayList(u8){};
+        errdefer buf.deinit(allocator);
 
         var tmp: [10]u8 = undefined;
         var n = varint.encode(self.samples.items.len, &tmp);
-        try buf.appendSlice(tmp[0..n]);
+        try buf.appendSlice(allocator, tmp[0..n]);
 
         var prev_byte_offset: u32 = 0;
         for (self.samples.items) |s| {
             const delta = s.byte_offset - prev_byte_offset;
             n = varint.encode(delta, &tmp);
-            try buf.appendSlice(tmp[0..n]);
+            try buf.appendSlice(allocator, tmp[0..n]);
             prev_byte_offset = s.byte_offset;
         }
 
-        return buf.toOwnedSlice();
+        return buf.toOwnedSlice(allocator);
     }
 };
 
@@ -523,8 +523,8 @@ pub fn findProximityMatches(
     positions_b: []const TrigramPosition,
     max_distance: u32,
 ) ![]struct { a: TrigramPosition, b: TrigramPosition } {
-    var matches = std.ArrayList(struct { a: TrigramPosition, b: TrigramPosition }).init(allocator);
-    errdefer matches.deinit();
+    var matches = std.ArrayList(struct { a: TrigramPosition, b: TrigramPosition }){};
+    errdefer matches.deinit(allocator);
 
     for (positions_a) |pa| {
         for (positions_b) |pb| {
@@ -534,12 +534,12 @@ pub fn findProximityMatches(
                 pb.rune_offset - pa.rune_offset;
 
             if (dist <= max_distance) {
-                try matches.append(.{ .a = pa, .b = pb });
+                try matches.append(allocator, .{ .a = pa, .b = pb });
             }
         }
     }
 
-    return matches.toOwnedSlice();
+    return matches.toOwnedSlice(allocator);
 }
 
 test "positional posting list encode decode" {

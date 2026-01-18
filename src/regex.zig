@@ -2,17 +2,14 @@ const std = @import("std");
 const trigram_mod = @import("trigram.zig");
 const Trigram = trigram_mod.Trigram;
 const fromBytes = trigram_mod.fromBytes;
-
-const posix_regex = @cImport({
-    @cInclude("regex.h");
-});
+const Regex = @import("regex").Regex;
 
 /// Extract trigrams from a literal string (sliding window of 3)
 fn extractTrigramsFromLiteral(allocator: std.mem.Allocator, s: []const u8) ![]Trigram {
     if (s.len < 3) return try allocator.alloc(Trigram, 0);
 
-    var trigrams = std.ArrayList(Trigram).init(allocator);
-    errdefer trigrams.deinit();
+    var trigrams = std.ArrayList(Trigram){};
+    errdefer trigrams.deinit(allocator);
 
     var i: usize = 0;
     while (i + 3 <= s.len) : (i += 1) {
@@ -25,10 +22,10 @@ fn extractTrigramsFromLiteral(allocator: std.mem.Allocator, s: []const u8) ![]Tr
                 break;
             }
         }
-        if (!found) try trigrams.append(t);
+        if (!found) try trigrams.append(allocator, t);
     }
 
-    return trigrams.toOwnedSlice();
+    return trigrams.toOwnedSlice(allocator);
 }
 
 /// Extract trigrams from a regex pattern by finding literal sequences.
@@ -43,8 +40,8 @@ fn extractTrigramsFromLiteral(allocator: std.mem.Allocator, s: []const u8) ![]Tr
 /// - Character classes []: Treated as non-literal
 /// - Escape sequences (\): The escaped char is literal
 pub fn extractTrigrams(allocator: std.mem.Allocator, pattern: []const u8) ![]Trigram {
-    var all_trigrams = std.ArrayList(Trigram).init(allocator);
-    defer all_trigrams.deinit();
+    var all_trigrams = std.ArrayList(Trigram){};
+    defer all_trigrams.deinit(allocator);
 
     // Find all literal sequences and extract their trigrams
     var i: usize = 0;
@@ -62,7 +59,7 @@ pub fn extractTrigrams(allocator: std.mem.Allocator, pattern: []const u8) ![]Tri
                 defer allocator.free(tris);
                 for (tris) |t| {
                     if (!containsTrigram(all_trigrams.items, t)) {
-                        try all_trigrams.append(t);
+                        try all_trigrams.append(allocator, t);
                     }
                 }
                 literal_start = null;
@@ -118,12 +115,12 @@ pub fn extractTrigrams(allocator: std.mem.Allocator, pattern: []const u8) ![]Tri
         defer allocator.free(tris);
         for (tris) |t| {
             if (!containsTrigram(all_trigrams.items, t)) {
-                try all_trigrams.append(t);
+                try all_trigrams.append(allocator, t);
             }
         }
     }
 
-    return all_trigrams.toOwnedSlice();
+    return all_trigrams.toOwnedSlice(allocator);
 }
 
 fn isSpecialChar(ch: u8) bool {
@@ -147,71 +144,46 @@ pub const MatchRange = struct {
     end: usize,
 };
 
-/// POSIX regex wrapper for actual matching
+/// Pure Zig regex wrapper for actual matching
 pub const PosixRegex = struct {
-    regex: *posix_regex.regex_t,
-    alloc: std.mem.Allocator,
+    regex: Regex,
 
     pub fn compile(pattern: []const u8, allocator: std.mem.Allocator) !PosixRegex {
-        const pattern_z = try allocator.dupeZ(u8, pattern);
-        defer allocator.free(pattern_z);
-
-        const regex = try allocator.create(posix_regex.regex_t);
-        errdefer allocator.destroy(regex);
-
-        const flags: c_int = posix_regex.REG_EXTENDED | posix_regex.REG_NEWLINE;
-        const result = posix_regex.regcomp(regex, pattern_z.ptr, flags);
-
-        if (result != 0) {
-            allocator.destroy(regex);
-            return error.InvalidRegex;
-        }
-
-        return .{ .regex = regex, .alloc = allocator };
+        const regex = Regex.compile(allocator, pattern) catch return error.InvalidRegex;
+        return .{ .regex = regex };
     }
 
     pub fn deinit(self: *PosixRegex) void {
-        posix_regex.regfree(self.regex);
-        self.alloc.destroy(self.regex);
+        self.regex.deinit();
     }
 
-    pub fn match(self: *const PosixRegex, text: []const u8, allocator: std.mem.Allocator) !bool {
-        const text_z = try allocator.dupeZ(u8, text);
-        defer allocator.free(text_z);
-
-        const result = posix_regex.regexec(self.regex, text_z.ptr, 0, null, 0);
-        return result == 0;
+    pub fn match(self: *PosixRegex, text: []const u8) bool {
+        return self.regex.partialMatch(text) catch false;
     }
 
     /// Find all match positions in text
-    pub fn findAll(self: *const PosixRegex, text: []const u8, allocator: std.mem.Allocator) ![]MatchRange {
-        const text_z = try allocator.dupeZ(u8, text);
-        defer allocator.free(text_z);
+    pub fn findAll(self: *PosixRegex, text: []const u8, allocator: std.mem.Allocator) ![]MatchRange {
+        var matches = std.ArrayList(MatchRange){};
+        errdefer matches.deinit(allocator);
 
-        var matches = std.ArrayList(MatchRange).init(allocator);
-        errdefer matches.deinit();
-
-        var pmatch: [1]posix_regex.regmatch_t = undefined;
         var offset: usize = 0;
-
         while (offset < text.len) {
-            const result = posix_regex.regexec(self.regex, text_z.ptr + offset, 1, &pmatch, 0);
-            if (result != 0) break;
-
-            const start = offset + @as(usize, @intCast(pmatch[0].rm_so));
-            const end = offset + @as(usize, @intCast(pmatch[0].rm_eo));
-
-            try matches.append(.{ .start = start, .end = end });
-
-            // Move past this match (prevent infinite loop on empty match)
-            if (end == start) {
-                offset += 1;
+            if (try self.regex.captures(text[offset..])) |caps_val| {
+                var caps = caps_val;
+                defer caps.deinit();
+                const span = caps.boundsAt(0) orelse {
+                    offset += 1;
+                    continue;
+                };
+                const start = offset + span.lower;
+                const end = offset + span.upper;
+                try matches.append(allocator, .{ .start = start, .end = end });
+                offset = if (end == start) offset + 1 else end;
             } else {
-                offset = end;
+                offset += 1;
             }
         }
-
-        return matches.toOwnedSlice();
+        return matches.toOwnedSlice(allocator);
     }
 };
 
@@ -292,9 +264,9 @@ test "posix regex compile and match" {
     var regex = try PosixRegex.compile("hello", allocator);
     defer regex.deinit();
 
-    try std.testing.expect(try regex.match("hello world", allocator));
-    try std.testing.expect(try regex.match("say hello", allocator));
-    try std.testing.expect(!try regex.match("goodbye", allocator));
+    try std.testing.expect(regex.match("hello world"));
+    try std.testing.expect(regex.match("say hello"));
+    try std.testing.expect(!regex.match("goodbye"));
 }
 
 test "posix regex find all" {
@@ -318,8 +290,8 @@ test "posix regex with pattern" {
     var regex = try PosixRegex.compile("[0-9]+", allocator);
     defer regex.deinit();
 
-    try std.testing.expect(try regex.match("abc123def", allocator));
-    try std.testing.expect(!try regex.match("abcdef", allocator));
+    try std.testing.expect(regex.match("abc123def"));
+    try std.testing.expect(!regex.match("abcdef"));
 }
 
 test "posix regex alternation" {
@@ -328,8 +300,8 @@ test "posix regex alternation" {
     var regex = try PosixRegex.compile("abc(def|ghi)", allocator);
     defer regex.deinit();
 
-    try std.testing.expect(try regex.match("abcdef", allocator));
-    try std.testing.expect(try regex.match("abcghi", allocator));
-    try std.testing.expect(!try regex.match("abcxyz", allocator));
-    try std.testing.expect(!try regex.match("xyzabc", allocator));
+    try std.testing.expect(regex.match("abcdef"));
+    try std.testing.expect(regex.match("abcghi"));
+    try std.testing.expect(!regex.match("abcxyz"));
+    try std.testing.expect(!regex.match("xyzabc"));
 }

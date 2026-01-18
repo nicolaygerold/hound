@@ -79,10 +79,10 @@ pub const PositionalIndexWriter = struct {
         return .{
             .allocator = allocator,
             .file = f,
-            .names = std.ArrayList([]const u8).init(allocator),
-            .contents = std.ArrayList([]const u8).init(allocator),
+            .names = std.ArrayList([]const u8){},
+            .contents = std.ArrayList([]const u8){},
             .postings = std.AutoHashMap(Trigram, *position.PositionalPostingList).init(allocator),
-            .rune_samplers = std.ArrayList(*position.RuneOffsetSampler).init(allocator),
+            .rune_samplers = std.ArrayList(*position.RuneOffsetSampler){},
             .current_offset = MAGIC_HEADER.len,
         };
     }
@@ -92,12 +92,12 @@ pub const PositionalIndexWriter = struct {
         for (self.names.items) |name| {
             self.allocator.free(name);
         }
-        self.names.deinit();
+        self.names.deinit(self.allocator);
 
         for (self.contents.items) |content| {
             self.allocator.free(content);
         }
-        self.contents.deinit();
+        self.contents.deinit(self.allocator);
 
         var it = self.postings.valueIterator();
         while (it.next()) |pl_ptr| {
@@ -110,20 +110,20 @@ pub const PositionalIndexWriter = struct {
             sampler.deinit();
             self.allocator.destroy(sampler);
         }
-        self.rune_samplers.deinit();
+        self.rune_samplers.deinit(self.allocator);
     }
 
     pub fn addFile(self: *PositionalIndexWriter, name: []const u8, content: []const u8) !void {
         const file_id: u32 = @intCast(self.names.items.len);
         const name_copy = try self.allocator.dupe(u8, name);
-        try self.names.append(name_copy);
+        try self.names.append(self.allocator, name_copy);
 
         const combined = try std.mem.concat(self.allocator, u8, &.{ name, "\n", content });
-        try self.contents.append(combined);
+        try self.contents.append(self.allocator, combined);
 
         const sampler = try self.allocator.create(position.RuneOffsetSampler);
         sampler.* = position.RuneOffsetSampler.init(self.allocator);
-        try self.rune_samplers.append(sampler);
+        try self.rune_samplers.append(self.allocator, sampler);
 
         self.extractPositionalTrigrams(file_id, combined, sampler) catch |err| switch (err) {
             error.ContainsNul, error.InvalidUtf8, error.FileTooLong, error.LineTooLong => return,
@@ -243,12 +243,12 @@ pub const PositionalIndexWriter = struct {
     fn writePostingLists(self: *PositionalIndexWriter) !u64 {
         const offset = self.current_offset;
 
-        var trigrams = std.ArrayList(Trigram).init(self.allocator);
-        defer trigrams.deinit();
+        var trigrams = std.ArrayList(Trigram){};
+        defer trigrams.deinit(self.allocator);
 
         var it = self.postings.keyIterator();
         while (it.next()) |tri| {
-            try trigrams.append(tri.*);
+            try trigrams.append(self.allocator, tri.*);
         }
         std.mem.sort(Trigram, trigrams.items, {}, std.sort.asc(Trigram));
 
@@ -267,12 +267,12 @@ pub const PositionalIndexWriter = struct {
     fn writePostingIndex(self: *PositionalIndexWriter) !u64 {
         const offset = self.current_offset;
 
-        var trigrams = std.ArrayList(Trigram).init(self.allocator);
-        defer trigrams.deinit();
+        var trigrams = std.ArrayList(Trigram){};
+        defer trigrams.deinit(self.allocator);
 
         var it = self.postings.keyIterator();
         while (it.next()) |tri| {
-            try trigrams.append(tri.*);
+            try trigrams.append(self.allocator, tri.*);
         }
         std.mem.sort(Trigram, trigrams.items, {}, std.sort.asc(Trigram));
 
@@ -344,7 +344,7 @@ fn validUtf8Pair(c1: u8, c2: u8) bool {
 
 test "positional index writer basic" {
     const allocator = std.testing.allocator;
-    const test_path = "/tmp/hound_positional_test.idx";
+    const test_path = "/tmp/hound_positional_writer_test.idx";
 
     {
         var writer = try PositionalIndexWriter.init(allocator, test_path);
@@ -377,7 +377,7 @@ test "positional index writer basic" {
 
 test "positional index positions recorded" {
     const allocator = std.testing.allocator;
-    const test_path = "/tmp/hound_positional_positions.idx";
+    const test_path = "/tmp/hound_positional_positions_recorded.idx";
 
     {
         var writer = try PositionalIndexWriter.init(allocator, test_path);
@@ -403,7 +403,7 @@ test "positional index positions recorded" {
 
 test "positional index utf8" {
     const allocator = std.testing.allocator;
-    const test_path = "/tmp/hound_positional_utf8.idx";
+    const test_path = "/tmp/hound_positional_utf8_test.idx";
 
     {
         var writer = try PositionalIndexWriter.init(allocator, test_path);

@@ -113,21 +113,21 @@ pub const Searcher = struct {
 
         if (trigrams.len == 0) return &[_]SearchResult{};
 
-        var posting_lists = std.ArrayList([]u32).init(self.allocator);
+        var posting_lists = std.ArrayList([]u32){};
         defer {
             for (posting_lists.items) |list| self.allocator.free(list);
-            posting_lists.deinit();
+            posting_lists.deinit(self.allocator);
         }
 
-        var posting_list_sizes = std.ArrayList(u32).init(self.allocator);
-        defer posting_list_sizes.deinit();
+        var posting_list_sizes = std.ArrayList(u32){};
+        defer posting_list_sizes.deinit(self.allocator);
 
         for (trigrams) |tri| {
             if (self.reader.lookupTrigram(tri)) |*view| {
                 var v = view.*;
                 const file_ids = try v.collect(self.allocator);
-                try posting_list_sizes.append(@intCast(file_ids.len));
-                try posting_lists.append(file_ids);
+                try posting_list_sizes.append(self.allocator, @intCast(file_ids.len));
+                try posting_lists.append(self.allocator, file_ids);
             }
         }
 
@@ -209,17 +209,17 @@ pub const Searcher = struct {
             }
         }
 
-        var results = std.ArrayList(SearchResult).init(self.allocator);
-        errdefer results.deinit();
+        var results = std.ArrayList(SearchResult){};
+        errdefer results.deinit(self.allocator);
 
         for (tasks) |task| {
             if (results.items.len >= max_results) break;
             if (task.result) |result| {
-                try results.append(result);
+                try results.append(self.allocator, result);
             }
         }
 
-        return results.toOwnedSlice();
+        return results.toOwnedSlice(self.allocator);
     }
 
     fn workerFn(ctx: WorkerContext) void {
@@ -302,20 +302,20 @@ pub const Searcher = struct {
         ) catch return null;
         defer posix.munmap(data);
 
-        var line_starts = std.ArrayList(usize).init(self.allocator);
-        defer line_starts.deinit();
-        line_starts.append(0) catch return null;
+        var line_starts = std.ArrayList(usize){};
+        defer line_starts.deinit(self.allocator);
+        line_starts.append(self.allocator, 0) catch return null;
 
         for (data, 0..) |byte, i| {
             if (byte == '\n' and i + 1 < data.len) {
-                line_starts.append(i + 1) catch return null;
+                line_starts.append(self.allocator, i + 1) catch return null;
             }
         }
 
         var match_lines = std.AutoHashMap(u32, std.ArrayList(MatchPosition)).init(self.allocator);
         defer {
             var it = match_lines.valueIterator();
-            while (it.next()) |list| list.deinit();
+            while (it.next()) |list| list.deinit(self.allocator);
             match_lines.deinit();
         }
 
@@ -333,9 +333,9 @@ pub const Searcher = struct {
 
                 const entry = match_lines.getOrPut(line_num) catch return null;
                 if (!entry.found_existing) {
-                    entry.value_ptr.* = std.ArrayList(MatchPosition).init(self.allocator);
+                    entry.value_ptr.* = std.ArrayList(MatchPosition){};
                 }
-                entry.value_ptr.append(match_in_line) catch return null;
+                entry.value_ptr.append(self.allocator, match_in_line) catch return null;
 
                 search_start = match_start + 1;
             } else {
@@ -362,11 +362,11 @@ pub const Searcher = struct {
             }
         }
 
-        var sorted_lines = std.ArrayList(u32).init(self.allocator);
-        defer sorted_lines.deinit();
+        var sorted_lines = std.ArrayList(u32){};
+        defer sorted_lines.deinit(self.allocator);
         var lines_it = lines_to_include.keyIterator();
         while (lines_it.next()) |k| {
-            sorted_lines.append(k.*) catch return null;
+            sorted_lines.append(self.allocator, k.*) catch return null;
         }
         std.mem.sort(u32, sorted_lines.items, {}, std.sort.asc(u32));
 
@@ -438,12 +438,12 @@ pub const Searcher = struct {
             }
         }
 
-        var result = std.ArrayList(FileCount).init(self.allocator);
-        errdefer result.deinit();
+        var result = std.ArrayList(FileCount){};
+        errdefer result.deinit(self.allocator);
 
         var it = counts.iterator();
         while (it.next()) |entry| {
-            try result.append(.{
+            try result.append(self.allocator, .{
                 .file_id = entry.key_ptr.*,
                 .count = entry.value_ptr.*,
             });
@@ -456,7 +456,7 @@ pub const Searcher = struct {
             }
         }.cmp);
 
-        return result.toOwnedSlice();
+        return result.toOwnedSlice(self.allocator);
     }
 
     fn intersectAndRankBM25(self: *Searcher, lists: [][]u32, posting_list_sizes: []u32) ![]FileCount {
@@ -468,7 +468,7 @@ pub const Searcher = struct {
         var tf_map = std.AutoHashMap(u32, std.ArrayList(u32)).init(self.allocator);
         defer {
             var vit = tf_map.valueIterator();
-            while (vit.next()) |list| list.deinit();
+            while (vit.next()) |list| list.deinit(self.allocator);
             tf_map.deinit();
         }
 
@@ -476,9 +476,9 @@ pub const Searcher = struct {
             for (list) |file_id| {
                 const entry = try tf_map.getOrPut(file_id);
                 if (!entry.found_existing) {
-                    entry.value_ptr.* = std.ArrayList(u32).init(self.allocator);
+                    entry.value_ptr.* = std.ArrayList(u32){};
                 }
-                try entry.value_ptr.append(@intCast(term_idx));
+                try entry.value_ptr.append(self.allocator, @intCast(term_idx));
             }
         }
 
@@ -522,13 +522,13 @@ pub const Searcher = struct {
             try scores.put(file_id, score);
         }
 
-        var result = std.ArrayList(FileCount).init(self.allocator);
-        errdefer result.deinit();
+        var result = std.ArrayList(FileCount){};
+        errdefer result.deinit(self.allocator);
 
         var score_it = scores.iterator();
         while (score_it.next()) |entry| {
             const score_u32: u32 = @intFromFloat(@max(0.0, entry.value_ptr.* * 1000.0));
-            try result.append(.{
+            try result.append(self.allocator, .{
                 .file_id = entry.key_ptr.*,
                 .count = score_u32,
             });
@@ -541,7 +541,7 @@ pub const Searcher = struct {
             }
         }.cmp);
 
-        return result.toOwnedSlice();
+        return result.toOwnedSlice(self.allocator);
     }
 
     pub fn freeResults(self: *Searcher, results: []SearchResult) void {
@@ -569,17 +569,17 @@ pub const Searcher = struct {
             return self.searchRegexFullScan(&regex, max_results);
         }
 
-        var posting_lists = std.ArrayList([]u32).init(self.allocator);
+        var posting_lists = std.ArrayList([]u32){};
         defer {
             for (posting_lists.items) |list| self.allocator.free(list);
-            posting_lists.deinit();
+            posting_lists.deinit(self.allocator);
         }
 
         for (trigrams) |tri| {
             if (self.reader.lookupTrigram(tri)) |*view| {
                 var v = view.*;
                 const file_ids = try v.collect(self.allocator);
-                try posting_lists.append(file_ids);
+                try posting_lists.append(self.allocator, file_ids);
             }
         }
 
@@ -661,30 +661,30 @@ pub const Searcher = struct {
             }
         }
 
-        var results = std.ArrayList(SearchResult).init(self.allocator);
-        errdefer results.deinit();
+        var results = std.ArrayList(SearchResult){};
+        errdefer results.deinit(self.allocator);
 
         for (tasks) |task| {
             if (results.items.len >= max_results) break;
             if (task.result) |result| {
-                try results.append(result);
+                try results.append(self.allocator, result);
             }
         }
 
-        return results.toOwnedSlice();
+        return results.toOwnedSlice(self.allocator);
     }
 
     /// Full scan when no trigrams available (fallback for regex like .* or [a-z]*)
-    fn searchRegexFullScan(self: *Searcher, regex: *const PosixRegex, max_results: usize) ![]SearchResult {
-        var results = std.ArrayList(SearchResult).init(self.allocator);
-        errdefer results.deinit();
+    fn searchRegexFullScan(self: *Searcher, regex: *PosixRegex, max_results: usize) ![]SearchResult {
+        var results = std.ArrayList(SearchResult){};
+        errdefer results.deinit(self.allocator);
 
         // Iterate through all indexed files
         var file_id: u32 = 0;
         while (results.items.len < max_results) : (file_id += 1) {
             const name = self.reader.getName(file_id) orelse break;
             if (self.extractRegexSnippets(name, regex)) |snippets| {
-                try results.append(.{
+                try results.append(self.allocator, .{
                     .file_id = file_id,
                     .match_count = @intCast(snippets.len),
                     .name = name,
@@ -693,11 +693,11 @@ pub const Searcher = struct {
             }
         }
 
-        return results.toOwnedSlice();
+        return results.toOwnedSlice(self.allocator);
     }
 
     /// Extract snippets for regex matches
-    fn extractRegexSnippets(self: *Searcher, path: []const u8, regex: *const PosixRegex) ?[]ContextSnippet {
+    fn extractRegexSnippets(self: *Searcher, path: []const u8, regex: *PosixRegex) ?[]ContextSnippet {
         const file = std.fs.cwd().openFile(path, .{}) catch return null;
         defer file.close();
 
@@ -716,13 +716,13 @@ pub const Searcher = struct {
         defer posix.munmap(data);
 
         // Build line starts
-        var line_starts = std.ArrayList(usize).init(self.allocator);
-        defer line_starts.deinit();
-        line_starts.append(0) catch return null;
+        var line_starts = std.ArrayList(usize){};
+        defer line_starts.deinit(self.allocator);
+        line_starts.append(self.allocator, 0) catch return null;
 
         for (data, 0..) |byte, i| {
             if (byte == '\n' and i + 1 < data.len) {
-                line_starts.append(i + 1) catch return null;
+                line_starts.append(self.allocator, i + 1) catch return null;
             }
         }
 
@@ -736,7 +736,7 @@ pub const Searcher = struct {
         var match_lines = std.AutoHashMap(u32, std.ArrayList(MatchPosition)).init(self.allocator);
         defer {
             var it = match_lines.valueIterator();
-            while (it.next()) |list| list.deinit();
+            while (it.next()) |list| list.deinit(self.allocator);
             match_lines.deinit();
         }
 
@@ -750,9 +750,9 @@ pub const Searcher = struct {
 
             const entry = match_lines.getOrPut(line_num) catch return null;
             if (!entry.found_existing) {
-                entry.value_ptr.* = std.ArrayList(MatchPosition).init(self.allocator);
+                entry.value_ptr.* = std.ArrayList(MatchPosition){};
             }
-            entry.value_ptr.append(match_in_line) catch return null;
+            entry.value_ptr.append(self.allocator, match_in_line) catch return null;
         }
 
         // Build context lines
@@ -774,11 +774,11 @@ pub const Searcher = struct {
         }
 
         // Sort and build snippets
-        var sorted_lines = std.ArrayList(u32).init(self.allocator);
-        defer sorted_lines.deinit();
+        var sorted_lines = std.ArrayList(u32){};
+        defer sorted_lines.deinit(self.allocator);
         var lines_it = lines_to_include.keyIterator();
         while (lines_it.next()) |k| {
-            sorted_lines.append(k.*) catch return null;
+            sorted_lines.append(self.allocator, k.*) catch return null;
         }
         std.mem.sort(u32, sorted_lines.items, {}, std.sort.asc(u32));
 
@@ -862,20 +862,20 @@ fn extractSnippetsStatic(path: []const u8, query: []const u8, context_lines: u32
     ) catch return null;
     defer posix.munmap(data);
 
-    var line_starts = std.ArrayList(usize).init(allocator);
-    defer line_starts.deinit();
-    line_starts.append(0) catch return null;
+    var line_starts = std.ArrayList(usize){};
+    defer line_starts.deinit(allocator);
+    line_starts.append(allocator, 0) catch return null;
 
     for (data, 0..) |byte, i| {
         if (byte == '\n' and i + 1 < data.len) {
-            line_starts.append(i + 1) catch return null;
+            line_starts.append(allocator, i + 1) catch return null;
         }
     }
 
     var match_lines = std.AutoHashMap(u32, std.ArrayList(MatchPosition)).init(allocator);
     defer {
         var it = match_lines.valueIterator();
-        while (it.next()) |list| list.deinit();
+        while (it.next()) |list| list.deinit(allocator);
         match_lines.deinit();
     }
 
@@ -893,9 +893,9 @@ fn extractSnippetsStatic(path: []const u8, query: []const u8, context_lines: u32
 
             const entry = match_lines.getOrPut(line_num) catch return null;
             if (!entry.found_existing) {
-                entry.value_ptr.* = std.ArrayList(MatchPosition).init(allocator);
+                entry.value_ptr.* = std.ArrayList(MatchPosition){};
             }
-            entry.value_ptr.append(match_in_line) catch return null;
+            entry.value_ptr.append(allocator, match_in_line) catch return null;
 
             search_start = match_start + 1;
         } else {
@@ -921,11 +921,11 @@ fn extractSnippetsStatic(path: []const u8, query: []const u8, context_lines: u32
         }
     }
 
-    var sorted_lines = std.ArrayList(u32).init(allocator);
-    defer sorted_lines.deinit();
+    var sorted_lines = std.ArrayList(u32){};
+    defer sorted_lines.deinit(allocator);
     var lines_it = lines_to_include.keyIterator();
     while (lines_it.next()) |k| {
-        sorted_lines.append(k.*) catch return null;
+        sorted_lines.append(allocator, k.*) catch return null;
     }
     std.mem.sort(u32, sorted_lines.items, {}, std.sort.asc(u32));
 
@@ -968,7 +968,7 @@ fn extractSnippetsStatic(path: []const u8, query: []const u8, context_lines: u32
     return snippets[0..snippet_count];
 }
 
-fn extractRegexSnippetsStatic(path: []const u8, regex: *const PosixRegex, context_lines: u32, max_snippets_per_file: u32, allocator: std.mem.Allocator) ?[]ContextSnippet {
+fn extractRegexSnippetsStatic(path: []const u8, regex: *PosixRegex, context_lines: u32, max_snippets_per_file: u32, allocator: std.mem.Allocator) ?[]ContextSnippet {
     const file = std.fs.cwd().openFile(path, .{}) catch return null;
     defer file.close();
 
@@ -986,13 +986,13 @@ fn extractRegexSnippetsStatic(path: []const u8, regex: *const PosixRegex, contex
     ) catch return null;
     defer posix.munmap(data);
 
-    var line_starts = std.ArrayList(usize).init(allocator);
-    defer line_starts.deinit();
-    line_starts.append(0) catch return null;
+    var line_starts = std.ArrayList(usize){};
+    defer line_starts.deinit(allocator);
+    line_starts.append(allocator, 0) catch return null;
 
     for (data, 0..) |byte, i| {
         if (byte == '\n' and i + 1 < data.len) {
-            line_starts.append(i + 1) catch return null;
+            line_starts.append(allocator, i + 1) catch return null;
         }
     }
 
@@ -1004,7 +1004,7 @@ fn extractRegexSnippetsStatic(path: []const u8, regex: *const PosixRegex, contex
     var match_lines = std.AutoHashMap(u32, std.ArrayList(MatchPosition)).init(allocator);
     defer {
         var it = match_lines.valueIterator();
-        while (it.next()) |list| list.deinit();
+        while (it.next()) |list| list.deinit(allocator);
         match_lines.deinit();
     }
 
@@ -1018,9 +1018,9 @@ fn extractRegexSnippetsStatic(path: []const u8, regex: *const PosixRegex, contex
 
         const entry = match_lines.getOrPut(line_num) catch return null;
         if (!entry.found_existing) {
-            entry.value_ptr.* = std.ArrayList(MatchPosition).init(allocator);
+            entry.value_ptr.* = std.ArrayList(MatchPosition){};
         }
-        entry.value_ptr.append(match_in_line) catch return null;
+        entry.value_ptr.append(allocator, match_in_line) catch return null;
     }
 
     var lines_to_include = std.AutoHashMap(u32, void).init(allocator);
@@ -1039,11 +1039,11 @@ fn extractRegexSnippetsStatic(path: []const u8, regex: *const PosixRegex, contex
         }
     }
 
-    var sorted_lines = std.ArrayList(u32).init(allocator);
-    defer sorted_lines.deinit();
+    var sorted_lines = std.ArrayList(u32){};
+    defer sorted_lines.deinit(allocator);
     var lines_it = lines_to_include.keyIterator();
     while (lines_it.next()) |k| {
-        sorted_lines.append(k.*) catch return null;
+        sorted_lines.append(allocator, k.*) catch return null;
     }
     std.mem.sort(u32, sorted_lines.items, {}, std.sort.asc(u32));
 
@@ -1102,10 +1102,11 @@ fn findLineNumberStatic(line_starts: []const usize, byte_offset: usize) u32 {
 
 test "searcher basic" {
     const allocator = std.testing.allocator;
-    const test_path = "/tmp/hound_search_test.idx";
-    const test_dir = "/tmp/hound_search_files";
+    const test_path = "/tmp/hound_searcher_basic_test.idx";
+    const test_dir = "/tmp/hound_searcher_basic_files";
     const index = @import("index.zig");
 
+    std.fs.cwd().deleteFile(test_path) catch {};
     std.fs.cwd().deleteTree(test_dir) catch {};
     try std.fs.cwd().makePath(test_dir);
 
@@ -1149,10 +1150,11 @@ test "searcher basic" {
 
 test "searcher ranking" {
     const allocator = std.testing.allocator;
-    const test_path = "/tmp/hound_search_rank_test.idx";
-    const test_dir = "/tmp/hound_search_rank_files";
+    const test_path = "/tmp/hound_searcher_ranking_test.idx";
+    const test_dir = "/tmp/hound_searcher_ranking_files";
     const index = @import("index.zig");
 
+    std.fs.cwd().deleteFile(test_path) catch {};
     std.fs.cwd().deleteTree(test_dir) catch {};
     try std.fs.cwd().makePath(test_dir);
 
@@ -1193,10 +1195,11 @@ test "searcher ranking" {
 
 test "searcher empty query" {
     const allocator = std.testing.allocator;
-    const test_path = "/tmp/hound_search_empty_test.idx";
-    const test_dir = "/tmp/hound_search_empty_files";
+    const test_path = "/tmp/hound_searcher_empty_query_test.idx";
+    const test_dir = "/tmp/hound_searcher_empty_query_files";
     const index = @import("index.zig");
 
+    std.fs.cwd().deleteFile(test_path) catch {};
     std.fs.cwd().deleteTree(test_dir) catch {};
     try std.fs.cwd().makePath(test_dir);
 
@@ -1228,10 +1231,11 @@ test "searcher empty query" {
 
 test "searcher no matches" {
     const allocator = std.testing.allocator;
-    const test_path = "/tmp/hound_search_nomatch_test.idx";
-    const test_dir = "/tmp/hound_search_nomatch_files";
+    const test_path = "/tmp/hound_searcher_no_matches_test.idx";
+    const test_dir = "/tmp/hound_searcher_no_matches_files";
     const index = @import("index.zig");
 
+    std.fs.cwd().deleteFile(test_path) catch {};
     std.fs.cwd().deleteTree(test_dir) catch {};
     try std.fs.cwd().makePath(test_dir);
 
@@ -1263,10 +1267,11 @@ test "searcher no matches" {
 
 test "content verification filters false positives" {
     const allocator = std.testing.allocator;
-    const test_path = "/tmp/hound_verify_test.idx";
-    const test_dir = "/tmp/hound_verify_files";
+    const test_path = "/tmp/hound_content_verification_filters_false_positives_test.idx";
+    const test_dir = "/tmp/hound_content_verification_filters_false_positives_files";
     const index = @import("index.zig");
 
+    std.fs.cwd().deleteFile(test_path) catch {};
     std.fs.cwd().deleteTree(test_dir) catch {};
     try std.fs.cwd().makePath(test_dir);
 
@@ -1305,10 +1310,11 @@ test "content verification filters false positives" {
 
 test "context snippets with line numbers and positions" {
     const allocator = std.testing.allocator;
-    const test_path = "/tmp/hound_snippet_test.idx";
-    const test_dir = "/tmp/hound_snippet_files";
+    const test_path = "/tmp/hound_context_snippets_line_numbers_test.idx";
+    const test_dir = "/tmp/hound_context_snippets_line_numbers_files";
     const index = @import("index.zig");
 
+    std.fs.cwd().deleteFile(test_path) catch {};
     std.fs.cwd().deleteTree(test_dir) catch {};
     try std.fs.cwd().makePath(test_dir);
 
@@ -1362,10 +1368,11 @@ test "context snippets with line numbers and positions" {
 
 test "context snippets include surrounding lines" {
     const allocator = std.testing.allocator;
-    const test_path = "/tmp/hound_ctx_test.idx";
-    const test_dir = "/tmp/hound_ctx_files";
+    const test_path = "/tmp/hound_context_snippets_surrounding_lines_test.idx";
+    const test_dir = "/tmp/hound_context_snippets_surrounding_lines_files";
     const index = @import("index.zig");
 
+    std.fs.cwd().deleteFile(test_path) catch {};
     std.fs.cwd().deleteTree(test_dir) catch {};
     try std.fs.cwd().makePath(test_dir);
 
@@ -1418,10 +1425,11 @@ test "context snippets include surrounding lines" {
 
 test "multiple matches on same line" {
     const allocator = std.testing.allocator;
-    const test_path = "/tmp/hound_multi_match_test.idx";
-    const test_dir = "/tmp/hound_multi_match_files";
+    const test_path = "/tmp/hound_multiple_matches_same_line_test.idx";
+    const test_dir = "/tmp/hound_multiple_matches_same_line_files";
     const index = @import("index.zig");
 
+    std.fs.cwd().deleteFile(test_path) catch {};
     std.fs.cwd().deleteTree(test_dir) catch {};
     try std.fs.cwd().makePath(test_dir);
 
@@ -1460,10 +1468,11 @@ test "multiple matches on same line" {
 
 test "regex search basic" {
     const allocator = std.testing.allocator;
-    const test_path = "/tmp/hound_regex_test.idx";
-    const test_dir = "/tmp/hound_regex_files";
+    const test_path = "/tmp/hound_regex_search_basic_test.idx";
+    const test_dir = "/tmp/hound_regex_search_basic_files";
     const index = @import("index.zig");
 
+    std.fs.cwd().deleteFile(test_path) catch {};
     std.fs.cwd().deleteTree(test_dir) catch {};
     try std.fs.cwd().makePath(test_dir);
 
@@ -1504,10 +1513,11 @@ test "regex search basic" {
 
 test "regex search with pattern" {
     const allocator = std.testing.allocator;
-    const test_path = "/tmp/hound_regex_pattern_test.idx";
-    const test_dir = "/tmp/hound_regex_pattern_files";
+    const test_path = "/tmp/hound_regex_search_with_pattern_test.idx";
+    const test_dir = "/tmp/hound_regex_search_with_pattern_files";
     const index = @import("index.zig");
 
+    std.fs.cwd().deleteFile(test_path) catch {};
     std.fs.cwd().deleteTree(test_dir) catch {};
     try std.fs.cwd().makePath(test_dir);
 
@@ -1542,10 +1552,11 @@ test "regex search with pattern" {
 
 test "regex search alternation" {
     const allocator = std.testing.allocator;
-    const test_path = "/tmp/hound_regex_alt_test.idx";
-    const test_dir = "/tmp/hound_regex_alt_files";
+    const test_path = "/tmp/hound_regex_search_alternation_test.idx";
+    const test_dir = "/tmp/hound_regex_search_alternation_files";
     const index = @import("index.zig");
 
+    std.fs.cwd().deleteFile(test_path) catch {};
     std.fs.cwd().deleteTree(test_dir) catch {};
     try std.fs.cwd().makePath(test_dir);
 
@@ -1587,10 +1598,11 @@ test "regex search alternation" {
 
 test "regex search with quantifiers" {
     const allocator = std.testing.allocator;
-    const test_path = "/tmp/hound_regex_quant_test.idx";
-    const test_dir = "/tmp/hound_regex_quant_files";
+    const test_path = "/tmp/hound_regex_search_with_quantifiers_test.idx";
+    const test_dir = "/tmp/hound_regex_search_with_quantifiers_files";
     const index = @import("index.zig");
 
+    std.fs.cwd().deleteFile(test_path) catch {};
     std.fs.cwd().deleteTree(test_dir) catch {};
     try std.fs.cwd().makePath(test_dir);
 
@@ -1624,10 +1636,11 @@ test "regex search with quantifiers" {
 
 test "parallel search with many files" {
     const allocator = std.testing.allocator;
-    const test_path = "/tmp/hound_parallel_test.idx";
-    const test_dir = "/tmp/hound_parallel_files";
+    const test_path = "/tmp/hound_parallel_search_many_files_test.idx";
+    const test_dir = "/tmp/hound_parallel_search_many_files";
     const index = @import("index.zig");
 
+    std.fs.cwd().deleteFile(test_path) catch {};
     std.fs.cwd().deleteTree(test_dir) catch {};
     try std.fs.cwd().makePath(test_dir);
 
@@ -1676,10 +1689,11 @@ test "parallel search with many files" {
 
 test "parallel regex search with many files" {
     const allocator = std.testing.allocator;
-    const test_path = "/tmp/hound_parallel_regex_test.idx";
-    const test_dir = "/tmp/hound_parallel_regex_files";
+    const test_path = "/tmp/hound_parallel_regex_search_many_files_test.idx";
+    const test_dir = "/tmp/hound_parallel_regex_search_many_files";
     const index = @import("index.zig");
 
+    std.fs.cwd().deleteFile(test_path) catch {};
     std.fs.cwd().deleteTree(test_dir) catch {};
     try std.fs.cwd().makePath(test_dir);
 
@@ -1724,10 +1738,11 @@ test "parallel regex search with many files" {
 
 test "single threaded fallback for small candidate sets" {
     const allocator = std.testing.allocator;
-    const test_path = "/tmp/hound_single_thread_test.idx";
-    const test_dir = "/tmp/hound_single_thread_files";
+    const test_path = "/tmp/hound_single_threaded_fallback_small_sets_test.idx";
+    const test_dir = "/tmp/hound_single_threaded_fallback_small_sets_files";
     const index = @import("index.zig");
 
+    std.fs.cwd().deleteFile(test_path) catch {};
     std.fs.cwd().deleteTree(test_dir) catch {};
     try std.fs.cwd().makePath(test_dir);
 
@@ -1758,10 +1773,11 @@ test "single threaded fallback for small candidate sets" {
 
 test "bm25 ranking basic" {
     const allocator = std.testing.allocator;
-    const test_path = "/tmp/hound_bm25_basic_test.idx";
-    const test_dir = "/tmp/hound_bm25_basic_files";
+    const test_path = "/tmp/hound_bm25_ranking_basic_test.idx";
+    const test_dir = "/tmp/hound_bm25_ranking_basic_files";
     const index = @import("index.zig");
 
+    std.fs.cwd().deleteFile(test_path) catch {};
     std.fs.cwd().deleteTree(test_dir) catch {};
     try std.fs.cwd().makePath(test_dir);
 
@@ -1804,10 +1820,11 @@ test "bm25 ranking basic" {
 
 test "bm25 vs trigram_count mode switch" {
     const allocator = std.testing.allocator;
-    const test_path = "/tmp/hound_bm25_mode_test.idx";
-    const test_dir = "/tmp/hound_bm25_mode_files";
+    const test_path = "/tmp/hound_bm25_vs_trigram_count_mode_test.idx";
+    const test_dir = "/tmp/hound_bm25_vs_trigram_count_mode_files";
     const index = @import("index.zig");
 
+    std.fs.cwd().deleteFile(test_path) catch {};
     std.fs.cwd().deleteTree(test_dir) catch {};
     try std.fs.cwd().makePath(test_dir);
 
@@ -1856,10 +1873,11 @@ test "bm25 vs trigram_count mode switch" {
 
 test "bm25 idf favors rare terms" {
     const allocator = std.testing.allocator;
-    const test_path = "/tmp/hound_bm25_idf_test.idx";
-    const test_dir = "/tmp/hound_bm25_idf_files";
+    const test_path = "/tmp/hound_bm25_idf_favors_rare_terms_test.idx";
+    const test_dir = "/tmp/hound_bm25_idf_favors_rare_terms_files";
     const index = @import("index.zig");
 
+    std.fs.cwd().deleteFile(test_path) catch {};
     std.fs.cwd().deleteTree(test_dir) catch {};
     try std.fs.cwd().makePath(test_dir);
 
@@ -1909,10 +1927,11 @@ test "bm25 idf favors rare terms" {
 
 test "bm25 multi-term query ranking" {
     const allocator = std.testing.allocator;
-    const test_path = "/tmp/hound_bm25_multi_test.idx";
-    const test_dir = "/tmp/hound_bm25_multi_files";
+    const test_path = "/tmp/hound_bm25_multi_term_query_ranking_test.idx";
+    const test_dir = "/tmp/hound_bm25_multi_term_query_ranking_files";
     const index = @import("index.zig");
 
+    std.fs.cwd().deleteFile(test_path) catch {};
     std.fs.cwd().deleteTree(test_dir) catch {};
     try std.fs.cwd().makePath(test_dir);
 
@@ -1956,10 +1975,11 @@ test "bm25 multi-term query ranking" {
 
 test "bm25 custom k1 and b parameters" {
     const allocator = std.testing.allocator;
-    const test_path = "/tmp/hound_bm25_params_test.idx";
-    const test_dir = "/tmp/hound_bm25_params_files";
+    const test_path = "/tmp/hound_bm25_custom_k1_b_params_test.idx";
+    const test_dir = "/tmp/hound_bm25_custom_k1_b_params_files";
     const index = @import("index.zig");
 
+    std.fs.cwd().deleteFile(test_path) catch {};
     std.fs.cwd().deleteTree(test_dir) catch {};
     try std.fs.cwd().makePath(test_dir);
 
@@ -1994,8 +2014,10 @@ test "bm25 custom k1 and b parameters" {
 
 test "bm25 empty index" {
     const allocator = std.testing.allocator;
-    const test_path = "/tmp/hound_bm25_empty_test.idx";
+    const test_path = "/tmp/hound_bm25_empty_index_test.idx";
     const index = @import("index.zig");
+
+    std.fs.cwd().deleteFile(test_path) catch {};
 
     {
         var writer = try index.IndexWriter.init(allocator, test_path);
@@ -2017,10 +2039,11 @@ test "bm25 empty index" {
 
 test "bm25 no matching trigrams" {
     const allocator = std.testing.allocator;
-    const test_path = "/tmp/hound_bm25_nomatch_test.idx";
-    const test_dir = "/tmp/hound_bm25_nomatch_files";
+    const test_path = "/tmp/hound_bm25_no_matching_trigrams_test.idx";
+    const test_dir = "/tmp/hound_bm25_no_matching_trigrams_files";
     const index = @import("index.zig");
 
+    std.fs.cwd().deleteFile(test_path) catch {};
     std.fs.cwd().deleteTree(test_dir) catch {};
     try std.fs.cwd().makePath(test_dir);
 

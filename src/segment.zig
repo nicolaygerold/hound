@@ -175,7 +175,7 @@ pub const SegmentReader = struct {
 };
 
 pub const DeletionBitmap = struct {
-    data: []align(std.mem.page_size) const u8,
+    data: []align(std.heap.page_size_min) const u8,
     fd: posix.fd_t,
     num_docs: u32,
     num_deleted: u32,
@@ -322,8 +322,10 @@ test "segment id generation and formatting" {
 
 test "segment writer basic" {
     const allocator = std.testing.allocator;
-    const test_path = "/tmp/hound_segment_test.seg";
+    const test_path = "/tmp/hound_segment_writer_basic_test.seg";
     const id = generateSegmentId();
+
+    std.fs.cwd().deleteFile(test_path) catch {};
 
     {
         var writer = try SegmentWriter.init(allocator, test_path, id);
@@ -344,8 +346,10 @@ test "segment writer basic" {
 
 test "segment reader basic" {
     const allocator = std.testing.allocator;
-    const test_path = "/tmp/hound_segment_reader_test.seg";
+    const test_path = "/tmp/hound_segment_reader_basic_open_test.seg";
     const id = generateSegmentId();
+
+    std.fs.cwd().deleteFile(test_path) catch {};
 
     {
         var writer = try SegmentWriter.init(allocator, test_path, id);
@@ -367,7 +371,9 @@ test "segment reader basic" {
 
 test "deletion bitmap write and read" {
     const allocator = std.testing.allocator;
-    const test_path = "/tmp/hound_deletion_test.del";
+    const test_path = "/tmp/hound_deletion_bitmap_write_read_test.del";
+
+    std.fs.cwd().deleteFile(test_path) catch {};
 
     {
         var writer = try DeletionBitmapWriter.init(allocator, 100);
@@ -399,9 +405,12 @@ test "deletion bitmap write and read" {
 
 test "segment reader with deletions" {
     const allocator = std.testing.allocator;
-    const seg_path = "/tmp/hound_seg_del_test.seg";
-    const del_path = "/tmp/hound_seg_del_test.del";
+    const seg_path = "/tmp/hound_segment_reader_with_deletions_test.seg";
+    const del_path = "/tmp/hound_segment_reader_with_deletions_test.del";
     const id = generateSegmentId();
+
+    std.fs.cwd().deleteFile(seg_path) catch {};
+    std.fs.cwd().deleteFile(del_path) catch {};
 
     {
         var writer = try SegmentWriter.init(allocator, seg_path, id);

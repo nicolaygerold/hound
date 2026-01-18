@@ -7,7 +7,7 @@ const index = @import("index.zig");
 const Trigram = trigram_mod.Trigram;
 
 pub const IndexReader = struct {
-    data: []align(std.mem.page_size) const u8,
+    data: []align(std.heap.page_size_min) const u8,
     fd: posix.fd_t,
     trailer: index.Trailer,
     posting_index: PostingIndex,
@@ -107,6 +107,7 @@ pub const IndexReader = struct {
 
 const PostingIndex = struct {
     entries: std.ArrayList(Entry),
+    allocator: std.mem.Allocator,
 
     const Entry = struct {
         tri: Trigram,
@@ -115,8 +116,8 @@ const PostingIndex = struct {
     };
 
     fn build(allocator: std.mem.Allocator, data: []const u8, _: u64) !PostingIndex {
-        var entries = std.ArrayList(Entry).init(allocator);
-        errdefer entries.deinit();
+        var entries = std.ArrayList(Entry){};
+        errdefer entries.deinit(allocator);
 
         var pos: usize = 0;
         while (pos + 3 <= data.len) {
@@ -129,18 +130,18 @@ const PostingIndex = struct {
             const offset_result = varint.decode(data[pos..]);
             pos += offset_result.bytes_read;
 
-            try entries.append(.{
+            try entries.append(allocator, .{
                 .tri = tri,
                 .count = @truncate(count_result.value),
                 .offset = offset_result.value,
             });
         }
 
-        return .{ .entries = entries };
+        return .{ .entries = entries, .allocator = allocator };
     }
 
     fn deinit(self: *PostingIndex) void {
-        self.entries.deinit();
+        self.entries.deinit(self.allocator);
     }
 
     fn lookup(self: *const PostingIndex, tri: Trigram) ?Entry {
@@ -197,20 +198,22 @@ pub const PostingListView = struct {
     }
 
     pub fn collect(self: *PostingListView, allocator: std.mem.Allocator) ![]u32 {
-        var list = std.ArrayList(u32).init(allocator);
-        errdefer list.deinit();
+        var list = std.ArrayList(u32){};
+        errdefer list.deinit(allocator);
 
         while (self.next()) |fid| {
-            try list.append(fid);
+            try list.append(allocator, fid);
         }
 
-        return list.toOwnedSlice();
+        return list.toOwnedSlice(allocator);
     }
 };
 
 test "index reader basic" {
     const allocator = std.testing.allocator;
-    const test_path = "/tmp/hound_reader_test.idx";
+    const test_path = "/tmp/hound_index_reader_basic_test.idx";
+
+    std.fs.cwd().deleteFile(test_path) catch {};
 
     {
         var writer = try index.IndexWriter.init(allocator, test_path);
@@ -234,7 +237,9 @@ test "index reader basic" {
 
 test "index reader trigram lookup" {
     const allocator = std.testing.allocator;
-    const test_path = "/tmp/hound_reader_trigram_test.idx";
+    const test_path = "/tmp/hound_index_reader_trigram_lookup_test.idx";
+
+    std.fs.cwd().deleteFile(test_path) catch {};
 
     {
         var writer = try index.IndexWriter.init(allocator, test_path);
@@ -271,7 +276,9 @@ test "index reader trigram lookup" {
 
 test "index reader empty index" {
     const allocator = std.testing.allocator;
-    const test_path = "/tmp/hound_reader_empty_test.idx";
+    const test_path = "/tmp/hound_index_reader_empty_index_test.idx";
+
+    std.fs.cwd().deleteFile(test_path) catch {};
 
     {
         var writer = try index.IndexWriter.init(allocator, test_path);

@@ -70,7 +70,7 @@ pub const IndexWriter = struct {
         return .{
             .allocator = allocator,
             .file = file,
-            .names = std.ArrayList([]const u8).init(allocator),
+            .names = .{},
             .postings = std.AutoHashMap(Trigram, *posting.PostingList).init(allocator),
             .extractor = try trigram_mod.Extractor.init(allocator),
             .current_offset = MAGIC_HEADER.len,
@@ -82,7 +82,7 @@ pub const IndexWriter = struct {
         for (self.names.items) |name| {
             self.allocator.free(name);
         }
-        self.names.deinit();
+        self.names.deinit(self.allocator);
 
         var it = self.postings.valueIterator();
         while (it.next()) |pl_ptr| {
@@ -104,7 +104,7 @@ pub const IndexWriter = struct {
 
         const file_id: u32 = @intCast(self.names.items.len);
         const name_copy = try self.allocator.dupe(u8, name);
-        try self.names.append(name_copy);
+        try self.names.append(self.allocator, name_copy);
 
         for (trigrams) |tri| {
             const entry = try self.postings.getOrPut(tri);
@@ -149,12 +149,12 @@ pub const IndexWriter = struct {
     fn writePostingLists(self: *IndexWriter) !u64 {
         const offset = self.current_offset;
 
-        var trigrams = std.ArrayList(Trigram).init(self.allocator);
-        defer trigrams.deinit();
+        var trigrams: std.ArrayList(Trigram) = .{};
+        defer trigrams.deinit(self.allocator);
 
         var it = self.postings.keyIterator();
         while (it.next()) |tri| {
-            try trigrams.append(tri.*);
+            try trigrams.append(self.allocator, tri.*);
         }
         std.mem.sort(Trigram, trigrams.items, {}, std.sort.asc(Trigram));
 
@@ -173,12 +173,12 @@ pub const IndexWriter = struct {
     fn writePostingIndex(self: *IndexWriter) !u64 {
         const offset = self.current_offset;
 
-        var trigrams = std.ArrayList(Trigram).init(self.allocator);
-        defer trigrams.deinit();
+        var trigrams: std.ArrayList(Trigram) = .{};
+        defer trigrams.deinit(self.allocator);
 
         var it = self.postings.keyIterator();
         while (it.next()) |tri| {
-            try trigrams.append(tri.*);
+            try trigrams.append(self.allocator, tri.*);
         }
         std.mem.sort(Trigram, trigrams.items, {}, std.sort.asc(Trigram));
 
@@ -208,7 +208,9 @@ pub const IndexWriter = struct {
 
 test "index writer basic" {
     const allocator = std.testing.allocator;
-    const test_path = "/tmp/hound_test.idx";
+    const test_path = "/tmp/hound_index_writer_basic_test.idx";
+
+    std.fs.cwd().deleteFile(test_path) catch {};
 
     {
         var writer = try IndexWriter.init(allocator, test_path);

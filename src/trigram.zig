@@ -30,21 +30,21 @@ pub const TrigramSet = struct {
         const sparse = try allocator.alloc(u32, SPARSE_SIZE);
         @memset(sparse, 0xFFFFFFFF);
         return .{
-            .dense = std.ArrayList(Trigram).init(allocator),
+            .dense = std.ArrayList(Trigram){},
             .sparse = sparse,
             .allocator = allocator,
         };
     }
 
     pub fn deinit(self: *TrigramSet) void {
-        self.dense.deinit();
+        self.dense.deinit(self.allocator);
         self.allocator.free(self.sparse);
     }
 
     pub fn add(self: *TrigramSet, t: Trigram) !void {
         if (self.sparse[t] == 0xFFFFFFFF) {
             self.sparse[t] = @intCast(self.dense.items.len);
-            try self.dense.append(t);
+            try self.dense.append(self.allocator, t);
         }
     }
 

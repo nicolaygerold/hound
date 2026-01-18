@@ -56,7 +56,7 @@ pub const SegmentIndexWriter = struct {
             .dir = dir_copy,
             .meta = meta,
             .path_index = path_index,
-            .pending_docs = std.ArrayList(PendingDoc).init(allocator),
+            .pending_docs = std.ArrayList(PendingDoc){},
             .pending_deletes = std.AutoHashMap(usize, std.ArrayList(u32)).init(allocator),
             .flush_threshold = options.flush_threshold,
             .owns_meta = true,
@@ -68,11 +68,11 @@ pub const SegmentIndexWriter = struct {
             self.allocator.free(doc.path);
             self.allocator.free(doc.content);
         }
-        self.pending_docs.deinit();
+        self.pending_docs.deinit(self.allocator);
 
         var del_it = self.pending_deletes.valueIterator();
         while (del_it.next()) |list| {
-            list.deinit();
+            list.deinit(self.allocator);
         }
         self.pending_deletes.deinit();
 
@@ -87,9 +87,9 @@ pub const SegmentIndexWriter = struct {
         if (self.path_index.get(path)) |existing_addr| {
             const del_list = try self.pending_deletes.getOrPut(existing_addr.segment_idx);
             if (!del_list.found_existing) {
-                del_list.value_ptr.* = std.ArrayList(u32).init(self.allocator);
+                del_list.value_ptr.* = std.ArrayList(u32){};
             }
-            try del_list.value_ptr.append(existing_addr.local_id);
+            try del_list.value_ptr.append(self.allocator, existing_addr.local_id);
         }
 
         const path_copy = try self.allocator.dupe(u8, path);
@@ -97,7 +97,7 @@ pub const SegmentIndexWriter = struct {
         const content_copy = try self.allocator.dupe(u8, content);
         errdefer self.allocator.free(content_copy);
 
-        try self.pending_docs.append(.{ .path = path_copy, .content = content_copy });
+        try self.pending_docs.append(self.allocator, .{ .path = path_copy, .content = content_copy });
 
         if (self.pending_docs.items.len >= self.flush_threshold) {
             try self.commit();
@@ -108,24 +108,24 @@ pub const SegmentIndexWriter = struct {
         if (self.path_index.get(path)) |addr| {
             const del_list = try self.pending_deletes.getOrPut(addr.segment_idx);
             if (!del_list.found_existing) {
-                del_list.value_ptr.* = std.ArrayList(u32).init(self.allocator);
+                del_list.value_ptr.* = std.ArrayList(u32){};
             }
-            try del_list.value_ptr.append(addr.local_id);
+            try del_list.value_ptr.append(self.allocator, addr.local_id);
             _ = self.path_index.remove(path);
         }
     }
 
     pub fn commit(self: *SegmentIndexWriter) !void {
-        var new_segments = std.ArrayList(SegmentMeta).init(self.allocator);
-        defer new_segments.deinit();
+        var new_segments = std.ArrayList(SegmentMeta){};
+        defer new_segments.deinit(self.allocator);
 
         for (self.meta.segments) |seg| {
-            try new_segments.append(seg);
+            try new_segments.append(self.allocator, seg);
         }
 
         if (self.pending_docs.items.len > 0) {
             const new_seg = try self.flushPendingDocs();
-            try new_segments.append(new_seg);
+            try new_segments.append(self.allocator, new_seg);
 
             const seg_idx = new_segments.items.len - 1;
             for (self.pending_docs.items, 0..) |doc, local_id| {
@@ -150,7 +150,7 @@ pub const SegmentIndexWriter = struct {
             if (seg_idx < new_segments.items.len) {
                 try self.applyDeletions(&new_segments.items[seg_idx], to_delete);
             }
-            entry.value_ptr.deinit();
+            entry.value_ptr.deinit(self.allocator);
         }
         self.pending_deletes.clearRetainingCapacity();
 
@@ -184,8 +184,9 @@ pub const SegmentIndexWriter = struct {
         defer self.allocator.free(tmp_path);
 
         var writer = try SegmentWriter.init(self.allocator, tmp_path, id);
+        var writer_closed = false;
         errdefer {
-            writer.deinit();
+            if (!writer_closed) writer.deinit();
             std.fs.cwd().deleteFile(tmp_path) catch {};
         }
 
@@ -195,6 +196,7 @@ pub const SegmentIndexWriter = struct {
 
         const meta = try writer.finish();
         writer.deinit();
+        writer_closed = true;
 
         try std.fs.cwd().rename(tmp_path, seg_path);
 
@@ -428,14 +430,14 @@ pub const SegmentIndexReader = struct {
         }
 
         pub fn collect(self: *TrigramIterator, allocator: std.mem.Allocator) ![]u32 {
-            var results = std.ArrayList(u32).init(allocator);
-            errdefer results.deinit();
+            var results: std.ArrayList(u32) = .{};
+            errdefer results.deinit(allocator);
 
             while (self.next()) |doc| {
-                try results.append(doc.global_id);
+                try results.append(allocator, doc.global_id);
             }
 
-            return results.toOwnedSlice();
+            return results.toOwnedSlice(allocator);
         }
     };
 };
@@ -500,8 +502,8 @@ pub fn mergeSegments(
 
     try std.fs.cwd().rename(tmp_path, new_seg_path);
 
-    var new_segments = std.ArrayList(SegmentMeta).init(allocator);
-    defer new_segments.deinit();
+    var new_segments: std.ArrayList(SegmentMeta) = .{};
+    defer new_segments.deinit(allocator);
 
     for (meta.segments) |seg| {
         var found = false;
@@ -512,10 +514,10 @@ pub fn mergeSegments(
             }
         }
         if (!found) {
-            try new_segments.append(seg);
+            try new_segments.append(allocator, seg);
         }
     }
-    try new_segments.append(new_seg_meta);
+    try new_segments.append(allocator, new_seg_meta);
 
     const new_meta = IndexMeta{
         .version = 1,
@@ -530,7 +532,7 @@ pub fn mergeSegments(
 
 test "segment index writer basic" {
     const allocator = std.testing.allocator;
-    const test_dir = "/tmp/hound_segidx_test";
+    const test_dir = "/tmp/hound_segment_index_writer_basic_test";
 
     std.fs.cwd().deleteTree(test_dir) catch {};
     defer std.fs.cwd().deleteTree(test_dir) catch {};
@@ -558,7 +560,7 @@ test "segment index writer basic" {
 
 test "segment index writer incremental" {
     const allocator = std.testing.allocator;
-    const test_dir = "/tmp/hound_segidx_incr_test";
+    const test_dir = "/tmp/hound_segment_index_writer_incremental_test";
 
     std.fs.cwd().deleteTree(test_dir) catch {};
     defer std.fs.cwd().deleteTree(test_dir) catch {};
@@ -587,7 +589,7 @@ test "segment index writer incremental" {
 
 test "segment index writer deletions" {
     const allocator = std.testing.allocator;
-    const test_dir = "/tmp/hound_segidx_del_test";
+    const test_dir = "/tmp/hound_segment_index_writer_deletions_test";
 
     std.fs.cwd().deleteTree(test_dir) catch {};
     defer std.fs.cwd().deleteTree(test_dir) catch {};
@@ -616,7 +618,7 @@ test "segment index writer deletions" {
 
 test "segment index reader basic" {
     const allocator = std.testing.allocator;
-    const test_dir = "/tmp/hound_segidx_reader_test";
+    const test_dir = "/tmp/hound_segment_index_reader_basic_test";
 
     std.fs.cwd().deleteTree(test_dir) catch {};
     defer std.fs.cwd().deleteTree(test_dir) catch {};
@@ -639,7 +641,7 @@ test "segment index reader basic" {
 
 test "segment index reader trigram lookup" {
     const allocator = std.testing.allocator;
-    const test_dir = "/tmp/hound_segidx_tri_test";
+    const test_dir = "/tmp/hound_segment_index_reader_trigram_lookup_test";
 
     std.fs.cwd().deleteTree(test_dir) catch {};
     defer std.fs.cwd().deleteTree(test_dir) catch {};
@@ -667,7 +669,7 @@ test "segment index reader trigram lookup" {
 
 test "segment index reader with deletions" {
     const allocator = std.testing.allocator;
-    const test_dir = "/tmp/hound_segidx_reader_del_test";
+    const test_dir = "/tmp/hound_segment_index_reader_with_deletions_test";
 
     std.fs.cwd().deleteTree(test_dir) catch {};
     defer std.fs.cwd().deleteTree(test_dir) catch {};
@@ -705,7 +707,7 @@ test "segment index reader with deletions" {
 
 test "segment index multi segment" {
     const allocator = std.testing.allocator;
-    const test_dir = "/tmp/hound_segidx_multi_test";
+    const test_dir = "/tmp/hound_segment_index_multi_segment_test";
 
     std.fs.cwd().deleteTree(test_dir) catch {};
     defer std.fs.cwd().deleteTree(test_dir) catch {};
@@ -750,7 +752,7 @@ test "segment index multi segment" {
 
 test "segment index update existing file" {
     const allocator = std.testing.allocator;
-    const test_dir = "/tmp/hound_segidx_update_test";
+    const test_dir = "/tmp/hound_segment_index_update_existing_file_test";
 
     std.fs.cwd().deleteTree(test_dir) catch {};
     defer std.fs.cwd().deleteTree(test_dir) catch {};
@@ -777,7 +779,7 @@ test "segment index update existing file" {
 
 test "e2e segment workflow with files on disk" {
     const allocator = std.testing.allocator;
-    const test_dir = "/tmp/hound_e2e_manual";
+    const test_dir = "/tmp/hound_e2e_segment_workflow_files_on_disk_test";
 
     std.fs.cwd().deleteTree(test_dir) catch {};
     defer std.fs.cwd().deleteTree(test_dir) catch {};

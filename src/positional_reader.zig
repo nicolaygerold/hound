@@ -7,7 +7,7 @@ const positional_index = @import("positional_index.zig");
 const Trigram = trigram_mod.Trigram;
 
 pub const PositionalIndexReader = struct {
-    data: []align(std.mem.page_size) const u8,
+    data: []align(std.heap.page_size_min) const u8,
     fd: posix.fd_t,
     trailer: positional_index.Trailer,
     posting_index: PostingIndex,
@@ -149,6 +149,7 @@ fn buildRuneMapOffsets(
 
 const PostingIndex = struct {
     entries: std.ArrayList(Entry),
+    allocator: std.mem.Allocator,
 
     const Entry = struct {
         tri: Trigram,
@@ -158,8 +159,8 @@ const PostingIndex = struct {
     };
 
     fn build(allocator: std.mem.Allocator, data: []const u8) !PostingIndex {
-        var entries = std.ArrayList(Entry).init(allocator);
-        errdefer entries.deinit();
+        var entries = std.ArrayList(Entry){};
+        errdefer entries.deinit(allocator);
 
         var pos: usize = 0;
         while (pos + 3 <= data.len) {
@@ -175,7 +176,7 @@ const PostingIndex = struct {
             const offset_result = varint.decode(data[pos..]);
             pos += offset_result.bytes_read;
 
-            try entries.append(.{
+            try entries.append(allocator, .{
                 .tri = tri,
                 .file_count = @truncate(file_count_result.value),
                 .position_count = @truncate(position_count_result.value),
@@ -183,11 +184,11 @@ const PostingIndex = struct {
             });
         }
 
-        return .{ .entries = entries };
+        return .{ .entries = entries, .allocator = allocator };
     }
 
     fn deinit(self: *PostingIndex) void {
-        self.entries.deinit();
+        self.entries.deinit(self.allocator);
     }
 
     fn lookup(self: *const PostingIndex, tri: Trigram) ?Entry {
@@ -281,15 +282,15 @@ pub const PositionalPostingListView = struct {
     }
 
     pub fn collectFileIds(self: *PositionalPostingListView, allocator: std.mem.Allocator) ![]u32 {
-        var list = std.ArrayList(u32).init(allocator);
-        errdefer list.deinit();
+        var list = std.ArrayList(u32){};
+        errdefer list.deinit(allocator);
 
         while (try self.next(allocator)) |entry| {
             allocator.free(entry.positions);
-            try list.append(entry.file_id);
+            try list.append(allocator, entry.file_id);
         }
 
-        return list.toOwnedSlice();
+        return list.toOwnedSlice(allocator);
     }
 };
 
@@ -332,8 +333,8 @@ pub fn proximitySearch(
         try file_positions_b.put(entry.file_id, entry.positions);
     }
 
-    var results = std.ArrayList(u32).init(allocator);
-    errdefer results.deinit();
+    var results = std.ArrayList(u32){};
+    errdefer results.deinit(allocator);
 
     var it = file_positions_a.iterator();
     while (it.next()) |kv| {
@@ -341,18 +342,18 @@ pub fn proximitySearch(
         const pos_a = kv.value_ptr.*;
         if (file_positions_b.get(file_id)) |pos_b| {
             if (position.proximityMatch(pos_a, pos_b, max_distance)) {
-                try results.append(file_id);
+                try results.append(allocator, file_id);
             }
         }
     }
 
     std.mem.sort(u32, results.items, {}, std.sort.asc(u32));
-    return results.toOwnedSlice();
+    return results.toOwnedSlice(allocator);
 }
 
 test "positional index reader basic" {
     const allocator = std.testing.allocator;
-    const test_path = "/tmp/hound_positional_reader_test.idx";
+    const test_path = "/tmp/hound_positional_reader_basic_test.idx";
 
     {
         var writer = try positional_index.PositionalIndexWriter.init(allocator, test_path);
@@ -376,7 +377,7 @@ test "positional index reader basic" {
 
 test "positional index reader trigram lookup with positions" {
     const allocator = std.testing.allocator;
-    const test_path = "/tmp/hound_positional_reader_positions.idx";
+    const test_path = "/tmp/hound_positional_reader_trigram_positions.idx";
 
     {
         var writer = try positional_index.PositionalIndexWriter.init(allocator, test_path);
@@ -404,7 +405,7 @@ test "positional index reader trigram lookup with positions" {
 
 test "proximity search" {
     const allocator = std.testing.allocator;
-    const test_path = "/tmp/hound_proximity_search.idx";
+    const test_path = "/tmp/hound_proximity_search_test.idx";
 
     {
         var writer = try positional_index.PositionalIndexWriter.init(allocator, test_path);
@@ -434,7 +435,7 @@ test "proximity search" {
 
 test "positional index rune map" {
     const allocator = std.testing.allocator;
-    const test_path = "/tmp/hound_positional_rune_map.idx";
+    const test_path = "/tmp/hound_positional_rune_map_test.idx";
 
     {
         var writer = try positional_index.PositionalIndexWriter.init(allocator, test_path);

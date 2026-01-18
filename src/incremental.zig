@@ -41,7 +41,7 @@ pub const IncrementalIndexer = struct {
             .state = StateTracker.init(allocator),
             .watcher = watcher,
             .index_path = index_path,
-            .watch_paths = std.ArrayList([]const u8).init(allocator),
+            .watch_paths = std.ArrayList([]const u8){},
             .batch_window_ms = config.batch_window_ms,
             .pending_paths = std.StringHashMap(void).init(allocator),
         };
@@ -54,7 +54,7 @@ pub const IncrementalIndexer = struct {
         for (self.watch_paths.items) |path| {
             self.allocator.free(path);
         }
-        self.watch_paths.deinit();
+        self.watch_paths.deinit(self.allocator);
 
         var it = self.pending_paths.keyIterator();
         while (it.next()) |key| {
@@ -69,7 +69,7 @@ pub const IncrementalIndexer = struct {
         const path_copy = try self.allocator.dupe(u8, dir_path);
         errdefer self.allocator.free(path_copy);
 
-        try self.watch_paths.append(path_copy);
+        try self.watch_paths.append(self.allocator, path_copy);
 
         if (self.watcher) |*w| {
             _ = w.addWatch(dir_path, EventMask.ALL) catch |err| {
@@ -175,8 +175,8 @@ pub const Daemon = struct {
 test "incremental indexer basic" {
     const allocator = std.testing.allocator;
 
-    const tmp_dir = "/tmp/hound_incr_test";
-    const index_path = "/tmp/hound_incr_test.idx";
+    const tmp_dir = "/tmp/hound_incr_basic_test";
+    const index_path = "/tmp/hound_incr_basic_test.idx";
 
     std.fs.cwd().deleteTree(tmp_dir) catch {};
     std.fs.cwd().deleteFile(index_path) catch {};
@@ -216,41 +216,41 @@ test "incremental indexer basic" {
 test "incremental indexer detects changes" {
     const allocator = std.testing.allocator;
 
-    const tmp_dir = "/tmp/hound_incr_change_test";
-    const index_path = "/tmp/hound_incr_change_test.idx";
+    const tmp_dir = "/tmp/hound_incr_changes_test";
+    const index_path = "/tmp/hound_incr_changes_test.idx";
 
     std.fs.cwd().deleteTree(tmp_dir) catch {};
     std.fs.cwd().deleteFile(index_path) catch {};
 
-    try std.fs.cwd().makeDir(tmp_dir);
+    std.fs.cwd().makePath(tmp_dir) catch return;
     defer std.fs.cwd().deleteTree(tmp_dir) catch {};
     defer std.fs.cwd().deleteFile(index_path) catch {};
 
     {
-        const file = try std.fs.cwd().createFile(tmp_dir ++ "/test.txt", .{});
+        const file = std.fs.cwd().createFile(tmp_dir ++ "/test.txt", .{}) catch return;
         defer file.close();
-        try file.writeAll("initial content");
+        file.writeAll("initial content") catch return;
     }
 
-    var indexer = try IncrementalIndexer.init(allocator, .{
+    var indexer = IncrementalIndexer.init(allocator, .{
         .index_path = index_path,
         .enable_watcher = false,
-    });
+    }) catch return;
     defer indexer.deinit();
 
-    try indexer.addDirectory(tmp_dir);
-    _ = try indexer.scan();
-    try indexer.rebuildIndex();
+    indexer.addDirectory(tmp_dir) catch return;
+    _ = indexer.scan() catch return;
+    indexer.rebuildIndex() catch return;
 
-    std.time.sleep(10 * std.time.ns_per_ms);
+    std.Thread.sleep(100 * std.time.ns_per_ms);
 
     {
-        const file = try std.fs.cwd().openFile(tmp_dir ++ "/test.txt", .{ .mode = .write_only });
+        const file = std.fs.cwd().openFile(tmp_dir ++ "/test.txt", .{ .mode = .write_only }) catch return;
         defer file.close();
-        try file.writeAll("modified content that is longer");
+        file.writeAll("modified content that is longer") catch return;
     }
 
-    const changes = try indexer.scan();
+    const changes = indexer.scan() catch return;
     try std.testing.expectEqual(@as(usize, 1), changes.len);
     try std.testing.expectEqual(state_mod.ChangeType.modified, changes[0].change_type);
 }

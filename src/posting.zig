@@ -28,17 +28,17 @@ pub const PostingList = struct {
     pub fn init(allocator: std.mem.Allocator, tri: Trigram) PostingList {
         return .{
             .tri = tri,
-            .file_ids = std.ArrayList(u32).init(allocator),
+            .file_ids = std.ArrayList(u32){},
             .allocator = allocator,
         };
     }
 
     pub fn deinit(self: *PostingList) void {
-        self.file_ids.deinit();
+        self.file_ids.deinit(self.allocator);
     }
 
     pub fn add(self: *PostingList, file_id: u32) !void {
-        try self.file_ids.append(file_id);
+        try self.file_ids.append(self.allocator, file_id);
     }
 
     pub fn sort(self: *PostingList) void {
@@ -46,11 +46,11 @@ pub const PostingList = struct {
     }
 
     pub fn encodeDelta(self: *const PostingList, allocator: std.mem.Allocator) ![]u8 {
-        var buf = std.ArrayList(u8).init(allocator);
-        errdefer buf.deinit();
+        var buf = std.ArrayList(u8){};
+        errdefer buf.deinit(allocator);
 
         const tri_bytes = trigram_mod.toBytes(self.tri);
-        try buf.appendSlice(&tri_bytes);
+        try buf.appendSlice(allocator, &tri_bytes);
 
         var prev: u32 = 0;
         var tmp: [10]u8 = undefined;
@@ -58,14 +58,14 @@ pub const PostingList = struct {
         for (self.file_ids.items) |fid| {
             const delta = fid - prev;
             const n = varint.encode(delta + 1, &tmp);
-            try buf.appendSlice(tmp[0..n]);
+            try buf.appendSlice(allocator, tmp[0..n]);
             prev = fid;
         }
 
         const n = varint.encode(0, &tmp);
-        try buf.appendSlice(tmp[0..n]);
+        try buf.appendSlice(allocator, tmp[0..n]);
 
-        return buf.toOwnedSlice();
+        return buf.toOwnedSlice(allocator);
     }
 };
 
@@ -99,14 +99,14 @@ pub const PostingListReader = struct {
     }
 
     pub fn collect(self: *PostingListReader, allocator: std.mem.Allocator) ![]u32 {
-        var list = std.ArrayList(u32).init(allocator);
-        errdefer list.deinit();
+        var list = std.ArrayList(u32){};
+        errdefer list.deinit(allocator);
 
         while (self.next()) |fid| {
-            try list.append(fid);
+            try list.append(allocator, fid);
         }
 
-        return list.toOwnedSlice();
+        return list.toOwnedSlice(allocator);
     }
 };
 

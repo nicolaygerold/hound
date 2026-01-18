@@ -96,7 +96,7 @@ pub const KqueueBackend = struct {
             .kq = kq,
             .watches = std.AutoArrayHashMap(i32, WatchEntry).init(allocator),
             .event_buf = undefined,
-            .pending_events = std.ArrayList(Event).init(allocator),
+            .pending_events = .{},
         };
     }
 
@@ -107,7 +107,7 @@ pub const KqueueBackend = struct {
             self.allocator.free(entry.value_ptr.path);
         }
         self.watches.deinit();
-        self.pending_events.deinit();
+        self.pending_events.deinit(self.allocator);
         posix.close(self.kq);
     }
 
@@ -164,8 +164,8 @@ pub const KqueueBackend = struct {
         self.pending_events.clearRetainingCapacity();
 
         const timeout: ?posix.timespec = if (timeout_ms) |ms| .{
-            .tv_sec = @intCast(ms / 1000),
-            .tv_nsec = @intCast((ms % 1000) * 1_000_000),
+            .sec = @intCast(ms / 1000),
+            .nsec = @intCast((ms % 1000) * 1_000_000),
         } else null;
 
         const n_events = try posix.kevent(
@@ -178,7 +178,7 @@ pub const KqueueBackend = struct {
         for (self.event_buf[0..n_events]) |ev| {
             const ev_fd: i32 = @intCast(ev.ident);
             if (self.watches.get(ev_fd)) |entry| {
-                try self.pending_events.append(.{
+                try self.pending_events.append(self.allocator, .{
                     .wd = @enumFromInt(ev_fd),
                     .mask = EventMask.fromFflags(ev.fflags),
                     .path = entry.path,
@@ -201,7 +201,7 @@ test "kqueue backend basic" {
     var backend = try KqueueBackend.init(allocator);
     defer backend.deinit();
 
-    const tmp_path = "/tmp/hound_kqueue_test.txt";
+    const tmp_path = "/tmp/hound_kqueue_backend_test.txt";
     {
         const file = try std.fs.cwd().createFile(tmp_path, .{});
         file.close();

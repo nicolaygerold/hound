@@ -1,6 +1,5 @@
 const std = @import("std");
 
 pub fn main() !void {
-    const stdout = std.io.getStdOut().writer();
-    try stdout.print("hound - fast text search\n", .{});
+    std.debug.print("hound - fast text search\n", .{});
 }

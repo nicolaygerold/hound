@@ -46,13 +46,13 @@ pub const Watcher = struct {
         return .{
             .allocator = allocator,
             .backend = try BackendType.init(allocator),
-            .events = std.ArrayList(Event).init(allocator),
+            .events = std.ArrayList(Event){},
         };
     }
 
     pub fn deinit(self: *Watcher) void {
         self.backend.deinit();
-        self.events.deinit();
+        self.events.deinit(self.allocator);
     }
 
     pub fn addWatch(self: *Watcher, path: []const u8, mask: EventMask) !WatchDescriptor {
@@ -129,7 +129,7 @@ pub const Watcher = struct {
                 else => null,
             };
 
-            try self.events.append(.{
+            try self.events.append(self.allocator, .{
                 .wd = @enumFromInt(@intFromEnum(ev.wd)),
                 .mask = mask,
                 .path = ev.path,
@@ -150,7 +150,7 @@ test "watcher unified api" {
     var watcher = try Watcher.init(allocator);
     defer watcher.deinit();
 
-    const tmp_path = "/tmp/hound_watcher_test.txt";
+    const tmp_path = "/tmp/hound_watcher_basic_test.txt";
     {
         const file = try std.fs.cwd().createFile(tmp_path, .{});
         file.close();

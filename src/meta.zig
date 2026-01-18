@@ -140,13 +140,12 @@ fn serializeMeta(allocator: std.mem.Allocator, meta: *const IndexMeta) ![]u8 {
         .segments = json_segments,
     };
 
-    var list = std.ArrayList(u8).init(allocator);
-    errdefer list.deinit();
+    var list = std.ArrayList(u8){};
+    errdefer list.deinit(allocator);
 
-    try std.json.stringify(json_meta, .{ .whitespace = .indent_2 }, list.writer());
-    try list.append('\n');
+    try list.writer(allocator).print("{f}\n", .{std.json.fmt(json_meta, .{ .whitespace = .indent_2 })});
 
-    return list.toOwnedSlice();
+    return list.toOwnedSlice(allocator);
 }
 
 const JsonSegmentMeta = struct {
@@ -217,7 +216,7 @@ pub const PathIndex = struct {
 
 test "meta save and load roundtrip" {
     const allocator = std.testing.allocator;
-    const test_dir = "/tmp/hound_meta_test";
+    const test_dir = "/tmp/hound_meta_roundtrip_test";
 
     std.fs.cwd().deleteTree(test_dir) catch {};
     defer std.fs.cwd().deleteTree(test_dir) catch {};
@@ -291,7 +290,7 @@ test "path index basic" {
 test "load nonexistent meta returns empty" {
     const allocator = std.testing.allocator;
 
-    const meta = try loadMeta(allocator, "/tmp/hound_nonexistent_meta_dir");
+    const meta = try loadMeta(allocator, "/tmp/hound_meta_nonexistent_dir");
 
     try std.testing.expectEqual(@as(u32, 1), meta.version);
     try std.testing.expectEqual(@as(u64, 0), meta.opstamp);

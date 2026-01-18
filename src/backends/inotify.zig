@@ -70,8 +70,8 @@ pub const InotifyBackend = struct {
             .inotify_fd = inotify_fd,
             .watches = std.AutoArrayHashMap(i32, WatchEntry).init(allocator),
             .event_buf = undefined,
-            .pending_events = std.ArrayList(Event).init(allocator),
-            .name_buf = std.ArrayList(u8).init(allocator),
+            .pending_events = std.ArrayList(Event){},
+            .name_buf = std.ArrayList(u8){},
         };
     }
 
@@ -81,8 +81,8 @@ pub const InotifyBackend = struct {
             self.allocator.free(entry.value_ptr.path);
         }
         self.watches.deinit();
-        self.pending_events.deinit();
-        self.name_buf.deinit();
+        self.pending_events.deinit(self.allocator);
+        self.name_buf.deinit(self.allocator);
         posix.close(self.inotify_fd);
     }
 
@@ -148,7 +148,7 @@ pub const InotifyBackend = struct {
             };
 
             if (self.watches.get(event.wd)) |entry| {
-                try self.pending_events.append(.{
+                try self.pending_events.append(self.allocator, .{
                     .wd = @enumFromInt(event.wd),
                     .mask = EventMask.fromMask(event.mask),
                     .path = entry.path,
@@ -174,7 +174,7 @@ test "inotify backend basic" {
     var backend = try InotifyBackend.init(allocator);
     defer backend.deinit();
 
-    const tmp_dir = "/tmp/hound_inotify_test";
+    const tmp_dir = "/tmp/hound_inotify_backend_test";
     std.fs.cwd().makeDir(tmp_dir) catch {};
     defer std.fs.cwd().deleteTree(tmp_dir) catch {};
 
