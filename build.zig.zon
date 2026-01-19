@@ -11,7 +11,7 @@
     },
     .dependencies = .{
         .regex = .{
-            .url = "https://github.com/tiehuis/zig-regex/archive/refs/heads/master.tar.gz",
+            .url = "git+https://github.com/tiehuis/zig-regex#49c5694c8b3ee4ae4a7131035a44a69841ef4740",
             .hash = "regex-0.1.3-axC357jaAQBRENglwG9NTcuej8pYz1IZmfwER_AXMlHZ",
         },
     },
