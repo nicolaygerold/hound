@@ -1,7 +1,7 @@
 .{
     .name = .hound,
     .version = "0.1.0",
-    .minimum_zig_version = "0.15.0",
+    .minimum_zig_version = "0.15.1",
     .fingerprint = 0xefbe6517d30c8677,
     .paths = .{
         "build.zig",
