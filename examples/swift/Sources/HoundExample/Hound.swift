@@ -168,10 +168,14 @@ public class Hound {
     /// Segment-based index writer with incremental updates and atomic commits
     public class SegmentIndexWriter {
         private var handle: OpaquePointer?
-        
-        public init?(directory: String) {
-            handle = hound_segment_index_writer_create(directory)
-            if handle == nil { return nil }
+
+        fileprivate init?(handle: OpaquePointer?) {
+            guard let handle else { return nil }
+            self.handle = handle
+        }
+
+        public convenience init?(directory: String) {
+            self.init(handle: hound_segment_index_writer_create(directory))
         }
         
         deinit {
@@ -220,10 +224,14 @@ public class Hound {
     /// Segment-based index reader
     public class SegmentIndexReader {
         fileprivate var handle: OpaquePointer?
-        
-        public init?(directory: String) {
-            handle = hound_segment_index_reader_open(directory)
-            if handle == nil { return nil }
+
+        fileprivate init?(handle: OpaquePointer?) {
+            guard let handle else { return nil }
+            self.handle = handle
+        }
+
+        public convenience init?(directory: String) {
+            self.init(handle: hound_segment_index_reader_open(directory))
         }
         
         deinit {
@@ -270,6 +278,40 @@ public class Hound {
             let bytes = Array(chars.utf8)
             guard bytes.count >= 3 else { return [] }
             return lookupTrigram((bytes[0], bytes[1], bytes[2]))
+        }
+    }
+
+    // MARK: - Index Manager
+
+    /// Manage multiple named indices within a base directory
+    public class IndexManager {
+        private var handle: OpaquePointer?
+
+        public init?(directory: String) {
+            handle = hound_index_manager_create(directory)
+            if handle == nil { return nil }
+        }
+
+        deinit {
+            if let handle = handle {
+                hound_index_manager_destroy(handle)
+            }
+        }
+
+        public func openWriter(index: String) -> SegmentIndexWriter? {
+            guard let handle = handle else { return nil }
+            guard let writerHandle = hound_index_manager_open_writer(handle, index) else {
+                return nil
+            }
+            return SegmentIndexWriter(handle: writerHandle)
+        }
+
+        public func openReader(index: String) -> SegmentIndexReader? {
+            guard let handle = handle else { return nil }
+            guard let readerHandle = hound_index_manager_open_reader(handle, index) else {
+                return nil
+            }
+            return SegmentIndexReader(handle: readerHandle)
         }
     }
 }

@@ -5,6 +5,7 @@ const search_mod = @import("search.zig");
 const incremental_mod = @import("incremental.zig");
 const state_mod = @import("state.zig");
 const segment_index_mod = @import("segment_index.zig");
+const index_manager_mod = @import("index_manager.zig");
 const trigram_mod = @import("trigram.zig");
 
 const IndexWriter = index_mod.IndexWriter;
@@ -16,6 +17,7 @@ const MatchPosition = search_mod.MatchPosition;
 const IncrementalIndexer = incremental_mod.IncrementalIndexer;
 const SegmentIndexWriter = segment_index_mod.SegmentIndexWriter;
 const SegmentIndexReader = segment_index_mod.SegmentIndexReader;
+const IndexManager = index_manager_mod.IndexManager;
 
 var gpa = std.heap.GeneralPurposeAllocator(.{}){};
 const allocator = gpa.allocator();
@@ -441,6 +443,53 @@ pub export fn hound_free_trigram_results(results: ?[*]u32, count: usize) void {
     if (results) |ptr| {
         allocator.free(ptr[0..count]);
     }
+}
+
+// ============================================================================
+// Index Manager API
+// ============================================================================
+
+pub const HoundIndexManager = opaque {};
+
+pub export fn hound_index_manager_create(dir: [*:0]const u8) ?*HoundIndexManager {
+    const manager = allocator.create(IndexManager) catch return null;
+    manager.* = IndexManager.init(allocator, std.mem.span(dir)) catch {
+        allocator.destroy(manager);
+        return null;
+    };
+    return @ptrCast(manager);
+}
+
+pub export fn hound_index_manager_destroy(manager_ptr: ?*HoundIndexManager) void {
+    const manager: *IndexManager = @ptrCast(@alignCast(manager_ptr orelse return));
+    manager.deinit();
+    allocator.destroy(manager);
+}
+
+pub export fn hound_index_manager_open_writer(
+    manager_ptr: ?*HoundIndexManager,
+    index: [*:0]const u8,
+) ?*HoundSegmentIndexWriter {
+    const manager: *IndexManager = @ptrCast(@alignCast(manager_ptr orelse return null));
+    const writer = allocator.create(SegmentIndexWriter) catch return null;
+    writer.* = manager.openWriter(std.mem.span(index)) catch {
+        allocator.destroy(writer);
+        return null;
+    };
+    return @ptrCast(writer);
+}
+
+pub export fn hound_index_manager_open_reader(
+    manager_ptr: ?*HoundIndexManager,
+    index: [*:0]const u8,
+) ?*HoundSegmentIndexReader {
+    const manager: *IndexManager = @ptrCast(@alignCast(manager_ptr orelse return null));
+    const reader = allocator.create(SegmentIndexReader) catch return null;
+    reader.* = manager.openReader(std.mem.span(index)) catch {
+        allocator.destroy(reader);
+        return null;
+    };
+    return @ptrCast(reader);
 }
 
 // ============================================================================

@@ -17,6 +17,7 @@ pub const positional_reader = @import("positional_reader.zig");
 pub const segment = @import("segment.zig");
 pub const meta = @import("meta.zig");
 pub const segment_index = @import("segment_index.zig");
+pub const index_manager = @import("index_manager.zig");
 
 test {
     std.testing.refAllDecls(@This());

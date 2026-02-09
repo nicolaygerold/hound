@@ -25,6 +25,7 @@ typedef struct HoundSearcher HoundSearcher;
 typedef struct HoundIncrementalIndexer HoundIncrementalIndexer;
 typedef struct HoundSegmentIndexWriter HoundSegmentIndexWriter;
 typedef struct HoundSegmentIndexReader HoundSegmentIndexReader;
+typedef struct HoundIndexManager HoundIndexManager;
 
 /* ============================================================================
  * Search Result Types
@@ -386,6 +387,51 @@ uint32_t* hound_segment_index_reader_lookup_trigram(
  * @param count Number of elements.
  */
 void hound_free_trigram_results(uint32_t* results, size_t count);
+
+/* ============================================================================
+ * Index Manager API
+ *
+ * Manage multiple named indices within a single directory.
+ * ============================================================================ */
+
+/**
+ * Create an index manager rooted at a base directory.
+ *
+ * @param dir Base directory path (null-terminated).
+ * @return Manager handle, or NULL on failure.
+ */
+HoundIndexManager* hound_index_manager_create(const char* dir);
+
+/**
+ * Destroy the index manager and free resources.
+ *
+ * @param manager Manager handle.
+ */
+void hound_index_manager_destroy(HoundIndexManager* manager);
+
+/**
+ * Open a segment index writer for a named index.
+ *
+ * @param manager Manager handle.
+ * @param index Index name (null-terminated).
+ * @return Writer handle, or NULL on failure.
+ */
+HoundSegmentIndexWriter* hound_index_manager_open_writer(
+    HoundIndexManager* manager,
+    const char* index
+);
+
+/**
+ * Open a segment index reader for a named index.
+ *
+ * @param manager Manager handle.
+ * @param index Index name (null-terminated).
+ * @return Reader handle, or NULL on failure.
+ */
+HoundSegmentIndexReader* hound_index_manager_open_reader(
+    HoundIndexManager* manager,
+    const char* index
+);
 
 /* ============================================================================
  * Utility API
