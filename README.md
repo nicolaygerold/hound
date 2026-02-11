@@ -9,6 +9,7 @@ Fast text search library with trigram indexing, inspired by [Google Code Search]
 - **Positional trigrams** - Store byte/rune offsets where each trigram appears, enabling proximity queries
 - **Regex search** - Filter candidates by extracting trigrams from regex patterns, then verify with full regex match
 - **Parallel search** - Multi-threaded file verification for faster search on multi-core systems
+- **Field-aware indexing** - Index documents with named fields (title, body, tags, etc.) and search with per-field BM25 boosts
 - **Ranked results** - Files ranked by how many query trigrams match (BM25 scoring)
 - **Context snippets** - Search results include matching lines with surrounding context, line numbers, and match positions
 - **File watching** - Incremental updates via inotify (Linux) / kqueue (macOS)
@@ -113,6 +114,60 @@ var parallel_searcher = try hound.search.Searcher.initWithOptions(allocator, &re
     .max_snippets_per_file = 10,
 });
 defer parallel_searcher.deinit();
+```
+
+#### Field-Aware Index with BM25 Boosting
+
+Index documents with named fields (e.g., title, body, tags) and search with per-field boosts:
+
+```zig
+const hound = @import("hound");
+
+// Create field-aware index
+var writer = try hound.field_index.FieldIndexWriter.init(allocator, "index.hound");
+defer writer.deinit();
+
+const title = try writer.addField("title");
+const body = try writer.addField("body");
+const tags = try writer.addField("tags");
+
+// Add documents with per-field content
+try writer.addFileField("doc.md", title, "Getting Started with Zig");
+try writer.addFileField("doc.md", body, "Zig is a systems programming language...");
+try writer.addFileField("doc.md", tags, "zig tutorial beginner");
+
+try writer.addFileField("notes.md", title, "Database Design");
+try writer.addFileField("notes.md", body, "Getting started with PostgreSQL...");
+try writer.addFileField("notes.md", tags, "database sql");
+
+try writer.finish();
+
+// Open and search
+var reader = try hound.field_reader.FieldIndexReader.open(allocator, "index.hound");
+defer reader.close();
+
+var searcher = try hound.field_search.FieldSearcher.init(allocator, &reader);
+defer searcher.deinit();
+
+// Search with field boosts: title matches weighted 3x, body 1x, tags 2x
+const results = try searcher.searchWithFields("getting started", &.{
+    .{ .field_id = title, .boost = 3.0 },
+    .{ .field_id = body, .boost = 1.0 },
+    .{ .field_id = tags, .boost = 2.0 },
+}, 10);
+defer searcher.freeResults(results);
+
+for (results) |r| {
+    std.debug.print("{s}: score={d:.2}, {d} matches\n", .{ r.name, r.score, r.match_count });
+}
+
+// Search a single field only
+const tag_results = try searcher.searchInField(tags, "zig", 10);
+defer searcher.freeResults(tag_results);
+
+// Search all fields with equal weight
+const all_results = try searcher.search("database", 10);
+defer searcher.freeResults(all_results);
 ```
 
 #### Positional Index with Proximity Search

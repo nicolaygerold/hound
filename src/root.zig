@@ -18,6 +18,9 @@ pub const segment = @import("segment.zig");
 pub const meta = @import("meta.zig");
 pub const segment_index = @import("segment_index.zig");
 pub const index_manager = @import("index_manager.zig");
+pub const field_index = @import("field_index.zig");
+pub const field_reader = @import("field_reader.zig");
+pub const field_search = @import("field_search.zig");
 
 test {
     std.testing.refAllDecls(@This());
