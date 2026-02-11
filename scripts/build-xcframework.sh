@@ -4,6 +4,7 @@ set -e
 VERSION="${1:-0.1.0}"
 OUTPUT_DIR="release"
 FRAMEWORK_NAME="CHound"
+BUILTINS_SRC="scripts/zig_builtins.zig"
 
 echo "Building XCFramework for version $VERSION..."
 
@@ -14,12 +15,16 @@ mkdir -p "$OUTPUT_DIR/macos-arm64" "$OUTPUT_DIR/macos-x86_64"
 # Build for macOS arm64
 echo "Building for macOS arm64..."
 zig build -Doptimize=ReleaseFast -Dtarget=aarch64-macos
-cp zig-out/lib/libhound_c.a "$OUTPUT_DIR/macos-arm64/"
+zig build-lib "$BUILTINS_SRC" -target aarch64-macos -OReleaseFast --name zig_builtins
+libtool -static -o "$OUTPUT_DIR/macos-arm64/libhound_c.a" zig-out/lib/libhound_c.a libzig_builtins.a
+rm -f libzig_builtins.a
 
 # Build for macOS x86_64
 echo "Building for macOS x86_64..."
 zig build -Doptimize=ReleaseFast -Dtarget=x86_64-macos
-cp zig-out/lib/libhound_c.a "$OUTPUT_DIR/macos-x86_64/"
+zig build-lib "$BUILTINS_SRC" -target x86_64-macos -OReleaseFast --name zig_builtins
+libtool -static -o "$OUTPUT_DIR/macos-x86_64/libhound_c.a" zig-out/lib/libhound_c.a libzig_builtins.a
+rm -f libzig_builtins.a
 
 # Create universal binary
 echo "Creating universal binary..."

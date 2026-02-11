@@ -53,6 +53,7 @@ pub fn build(b: *std.Build) void {
         }),
     });
     c_lib_static.linkLibC();
+    c_lib_static.bundle_compiler_rt = true;
     b.installArtifact(c_lib_static);
 
     // C API shared library
