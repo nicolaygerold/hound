@@ -26,22 +26,47 @@ typedef struct HoundIncrementalIndexer HoundIncrementalIndexer;
 typedef struct HoundSegmentIndexWriter HoundSegmentIndexWriter;
 typedef struct HoundSegmentIndexReader HoundSegmentIndexReader;
 typedef struct HoundIndexManager HoundIndexManager;
+typedef struct HoundFieldIndexWriter HoundFieldIndexWriter;
+typedef struct HoundFieldIndexReader HoundFieldIndexReader;
+typedef struct HoundFieldSearcher HoundFieldSearcher;
 
 /* ============================================================================
  * Search Result Types
  * ============================================================================ */
 
 typedef struct {
+    size_t start;
+    size_t end;
+} HoundMatchPosition;
+
+typedef struct {
+    uint32_t line_number;
+    size_t byte_offset;
+    const char* line_content;
+    size_t line_content_len;
+    HoundMatchPosition* matches;
+    size_t match_count;
+} HoundContextSnippet;
+
+typedef struct {
     uint32_t file_id;
     uint32_t match_count;
     const char* name;
     size_t name_len;
+    HoundContextSnippet* snippets;
+    size_t snippet_count;
+    double score;
 } HoundSearchResult;
 
 typedef struct {
     HoundSearchResult* results;
     size_t count;
 } HoundSearchResults;
+
+typedef struct {
+    uint32_t field_id;
+    double boost;
+} HoundFieldBoost;
 
 /* ============================================================================
  * Index Writer API
@@ -434,13 +459,180 @@ HoundSegmentIndexReader* hound_index_manager_open_reader(
 );
 
 /* ============================================================================
+ * Field Index Writer API
+ *
+ * Create a field-aware index with per-field content.
+ * ============================================================================ */
+
+/**
+ * Create a new field index writer.
+ *
+ * @param path Path where the field index file will be written (null-terminated).
+ * @return Writer handle, or NULL on failure.
+ */
+HoundFieldIndexWriter* hound_field_index_writer_create(const char* path);
+
+/**
+ * Register a field name and return its ID.
+ *
+ * @param writer Writer handle.
+ * @param name Field name (null-terminated).
+ * @return Field ID (>= 0) on success, -1 on failure.
+ */
+int64_t hound_field_index_writer_add_field(
+    HoundFieldIndexWriter* writer,
+    const char* name
+);
+
+/**
+ * Add content for a file in a specific field.
+ *
+ * @param writer Writer handle.
+ * @param name File name/path (null-terminated).
+ * @param field_id Field ID from hound_field_index_writer_add_field().
+ * @param content Content bytes.
+ * @param content_len Length of content in bytes.
+ * @return true on success, false on failure.
+ */
+bool hound_field_index_writer_add_file_field(
+    HoundFieldIndexWriter* writer,
+    const char* name,
+    uint32_t field_id,
+    const uint8_t* content,
+    size_t content_len
+);
+
+/**
+ * Finish writing and finalize the field index.
+ *
+ * @param writer Writer handle.
+ * @return true on success, false on failure.
+ */
+bool hound_field_index_writer_finish(HoundFieldIndexWriter* writer);
+
+/**
+ * Destroy the field index writer and free resources.
+ *
+ * @param writer Writer handle.
+ */
+void hound_field_index_writer_destroy(HoundFieldIndexWriter* writer);
+
+/* ============================================================================
+ * Field Index Reader API
+ *
+ * Open and query a field-aware index.
+ * ============================================================================ */
+
+/**
+ * Open an existing field index file.
+ *
+ * @param path Path to the field index file (null-terminated).
+ * @return Reader handle, or NULL on failure.
+ */
+HoundFieldIndexReader* hound_field_index_reader_open(const char* path);
+
+/**
+ * Close the field index reader and free resources.
+ *
+ * @param reader Reader handle.
+ */
+void hound_field_index_reader_close(HoundFieldIndexReader* reader);
+
+/**
+ * Get the number of fields in the index.
+ *
+ * @param reader Reader handle.
+ * @return Number of fields.
+ */
+uint64_t hound_field_index_reader_field_count(HoundFieldIndexReader* reader);
+
+/**
+ * Get the number of documents (names) in the index.
+ *
+ * @param reader Reader handle.
+ * @return Number of documents.
+ */
+uint64_t hound_field_index_reader_name_count(HoundFieldIndexReader* reader);
+
+/* ============================================================================
+ * Field Searcher API
+ *
+ * Search a field-aware index with BM25 ranking and per-field boosts.
+ * ============================================================================ */
+
+/**
+ * Create a field searcher for an open field index.
+ *
+ * @param reader Field index reader handle (must remain open while searcher is in use).
+ * @return Searcher handle, or NULL on failure.
+ */
+HoundFieldSearcher* hound_field_searcher_create(HoundFieldIndexReader* reader);
+
+/**
+ * Destroy the field searcher and free resources.
+ *
+ * @param searcher Searcher handle.
+ */
+void hound_field_searcher_destroy(HoundFieldSearcher* searcher);
+
+/**
+ * Search across all fields with equal weight.
+ *
+ * @param searcher Searcher handle.
+ * @param query Search query string (null-terminated).
+ * @param max_results Maximum number of results to return.
+ * @return Search results, or NULL on failure. Must be freed with hound_search_results_free().
+ */
+HoundSearchResults* hound_field_search(
+    HoundFieldSearcher* searcher,
+    const char* query,
+    size_t max_results
+);
+
+/**
+ * Search in a single field only.
+ *
+ * @param searcher Searcher handle.
+ * @param field_id Field ID to search in.
+ * @param query Search query string (null-terminated).
+ * @param max_results Maximum number of results to return.
+ * @return Search results, or NULL on failure. Must be freed with hound_search_results_free().
+ */
+HoundSearchResults* hound_field_search_in_field(
+    HoundFieldSearcher* searcher,
+    uint32_t field_id,
+    const char* query,
+    size_t max_results
+);
+
+/**
+ * Search across specified fields with per-field boosts.
+ *
+ * @param searcher Searcher handle.
+ * @param query Search query string (null-terminated).
+ * @param field_ids Array of field IDs.
+ * @param boosts Array of boost values (same length as field_ids).
+ * @param num_fields Number of elements in field_ids and boosts arrays.
+ * @param max_results Maximum number of results to return.
+ * @return Search results, or NULL on failure. Must be freed with hound_search_results_free().
+ */
+HoundSearchResults* hound_field_search_with_fields(
+    HoundFieldSearcher* searcher,
+    const char* query,
+    const uint32_t* field_ids,
+    const double* boosts,
+    size_t num_fields,
+    size_t max_results
+);
+
+/* ============================================================================
  * Utility API
  * ============================================================================ */
 
 /**
  * Get the library version string.
  *
- * @return Version string (e.g., "0.1.0").
+ * @return Version string (e.g., "0.2.1").
  */
 const char* hound_version(void);
 

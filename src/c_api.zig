@@ -7,6 +7,9 @@ const state_mod = @import("state.zig");
 const segment_index_mod = @import("segment_index.zig");
 const index_manager_mod = @import("index_manager.zig");
 const trigram_mod = @import("trigram.zig");
+const field_index_mod = @import("field_index.zig");
+const field_reader_mod = @import("field_reader.zig");
+const field_search_mod = @import("field_search.zig");
 
 const IndexWriter = index_mod.IndexWriter;
 const IndexReader = reader_mod.IndexReader;
@@ -18,6 +21,11 @@ const IncrementalIndexer = incremental_mod.IncrementalIndexer;
 const SegmentIndexWriter = segment_index_mod.SegmentIndexWriter;
 const SegmentIndexReader = segment_index_mod.SegmentIndexReader;
 const IndexManager = index_manager_mod.IndexManager;
+const FieldIndexWriter = field_index_mod.FieldIndexWriter;
+const FieldIndexReader = field_reader_mod.FieldIndexReader;
+const FieldSearcher = field_search_mod.FieldSearcher;
+const FieldSearchResult = field_search_mod.SearchResult;
+const FieldBoost = field_search_mod.FieldBoost;
 
 var gpa = std.heap.GeneralPurposeAllocator(.{}){};
 const allocator = gpa.allocator();
@@ -118,6 +126,12 @@ pub const HoundSearchResult = extern struct {
     name_len: usize,
     snippets: [*]HoundContextSnippet,
     snippet_count: usize,
+    score: f64,
+};
+
+pub const HoundFieldBoost = extern struct {
+    field_id: u32,
+    boost: f64,
 };
 
 pub const HoundSearchResults = extern struct {
@@ -224,6 +238,7 @@ pub export fn hound_search(
             .name_len = r.name.len,
             .snippets = c_snippets.ptr,
             .snippet_count = r.snippets.len,
+            .score = 0.0,
         };
     }
 
@@ -493,9 +508,242 @@ pub export fn hound_index_manager_open_reader(
 }
 
 // ============================================================================
+// Field Index Writer API
+// ============================================================================
+
+pub const HoundFieldIndexWriter = opaque {};
+
+pub export fn hound_field_index_writer_create(path: [*:0]const u8) ?*HoundFieldIndexWriter {
+    const writer = allocator.create(FieldIndexWriter) catch return null;
+    writer.* = FieldIndexWriter.init(allocator, std.mem.span(path)) catch {
+        allocator.destroy(writer);
+        return null;
+    };
+    return @ptrCast(writer);
+}
+
+pub export fn hound_field_index_writer_add_field(
+    writer_ptr: ?*HoundFieldIndexWriter,
+    name: [*:0]const u8,
+) i64 {
+    const writer: *FieldIndexWriter = @ptrCast(@alignCast(writer_ptr orelse return -1));
+    const field_id = writer.addField(std.mem.span(name)) catch return -1;
+    return @intCast(field_id);
+}
+
+pub export fn hound_field_index_writer_add_file_field(
+    writer_ptr: ?*HoundFieldIndexWriter,
+    name: [*:0]const u8,
+    field_id: u32,
+    content: [*]const u8,
+    content_len: usize,
+) bool {
+    const writer: *FieldIndexWriter = @ptrCast(@alignCast(writer_ptr orelse return false));
+    writer.addFileField(std.mem.span(name), field_id, content[0..content_len]) catch return false;
+    return true;
+}
+
+pub export fn hound_field_index_writer_finish(writer_ptr: ?*HoundFieldIndexWriter) bool {
+    const writer: *FieldIndexWriter = @ptrCast(@alignCast(writer_ptr orelse return false));
+    writer.finish() catch return false;
+    return true;
+}
+
+pub export fn hound_field_index_writer_destroy(writer_ptr: ?*HoundFieldIndexWriter) void {
+    const writer: *FieldIndexWriter = @ptrCast(@alignCast(writer_ptr orelse return));
+    writer.deinit();
+    allocator.destroy(writer);
+}
+
+// ============================================================================
+// Field Index Reader API
+// ============================================================================
+
+pub const HoundFieldIndexReader = opaque {};
+
+pub export fn hound_field_index_reader_open(path: [*:0]const u8) ?*HoundFieldIndexReader {
+    const reader = allocator.create(FieldIndexReader) catch return null;
+    reader.* = FieldIndexReader.open(allocator, std.mem.span(path)) catch {
+        allocator.destroy(reader);
+        return null;
+    };
+    return @ptrCast(reader);
+}
+
+pub export fn hound_field_index_reader_close(reader_ptr: ?*HoundFieldIndexReader) void {
+    const reader: *FieldIndexReader = @ptrCast(@alignCast(reader_ptr orelse return));
+    reader.close();
+    allocator.destroy(reader);
+}
+
+pub export fn hound_field_index_reader_field_count(reader_ptr: ?*HoundFieldIndexReader) u64 {
+    const reader: *FieldIndexReader = @ptrCast(@alignCast(reader_ptr orelse return 0));
+    return reader.fieldCount();
+}
+
+pub export fn hound_field_index_reader_name_count(reader_ptr: ?*HoundFieldIndexReader) u64 {
+    const reader: *FieldIndexReader = @ptrCast(@alignCast(reader_ptr orelse return 0));
+    return reader.nameCount();
+}
+
+// ============================================================================
+// Field Searcher API
+// ============================================================================
+
+pub const HoundFieldSearcher = opaque {};
+
+pub export fn hound_field_searcher_create(reader_ptr: ?*HoundFieldIndexReader) ?*HoundFieldSearcher {
+    const reader: *FieldIndexReader = @ptrCast(@alignCast(reader_ptr orelse return null));
+    const searcher = allocator.create(FieldSearcher) catch return null;
+    searcher.* = FieldSearcher.init(allocator, reader) catch {
+        allocator.destroy(searcher);
+        return null;
+    };
+    return @ptrCast(searcher);
+}
+
+pub export fn hound_field_searcher_destroy(searcher_ptr: ?*HoundFieldSearcher) void {
+    const searcher: *FieldSearcher = @ptrCast(@alignCast(searcher_ptr orelse return));
+    searcher.deinit();
+    allocator.destroy(searcher);
+}
+
+pub export fn hound_field_search(
+    searcher_ptr: ?*HoundFieldSearcher,
+    query: [*:0]const u8,
+    max_results: usize,
+) ?*HoundSearchResults {
+    const searcher: *FieldSearcher = @ptrCast(@alignCast(searcher_ptr orelse return null));
+    const results = searcher.search(std.mem.span(query), max_results) catch return null;
+    return convertFieldResultsToC(results, searcher);
+}
+
+pub export fn hound_field_search_in_field(
+    searcher_ptr: ?*HoundFieldSearcher,
+    field_id: u32,
+    query: [*:0]const u8,
+    max_results: usize,
+) ?*HoundSearchResults {
+    const searcher: *FieldSearcher = @ptrCast(@alignCast(searcher_ptr orelse return null));
+    const results = searcher.searchInField(field_id, std.mem.span(query), max_results) catch return null;
+    return convertFieldResultsToC(results, searcher);
+}
+
+pub export fn hound_field_search_with_fields(
+    searcher_ptr: ?*HoundFieldSearcher,
+    query: [*:0]const u8,
+    field_ids: [*]const u32,
+    boosts: [*]const f64,
+    num_fields: usize,
+    max_results: usize,
+) ?*HoundSearchResults {
+    const searcher: *FieldSearcher = @ptrCast(@alignCast(searcher_ptr orelse return null));
+
+    const field_boosts = allocator.alloc(FieldBoost, num_fields) catch return null;
+    defer allocator.free(field_boosts);
+
+    for (0..num_fields) |i| {
+        field_boosts[i] = .{ .field_id = field_ids[i], .boost = boosts[i] };
+    }
+
+    const results = searcher.searchWithFields(std.mem.span(query), field_boosts, max_results) catch return null;
+    return convertFieldResultsToC(results, searcher);
+}
+
+fn convertFieldResultsToC(results: []FieldSearchResult, searcher: *FieldSearcher) ?*HoundSearchResults {
+    if (results.len == 0) {
+        searcher.freeResults(results);
+        const empty = allocator.create(HoundSearchResults) catch return null;
+        empty.* = .{ .results = undefined, .count = 0 };
+        return empty;
+    }
+
+    const c_results = allocator.alloc(HoundSearchResult, results.len) catch {
+        searcher.freeResults(results);
+        return null;
+    };
+
+    for (results, 0..) |r, i| {
+        const name_copy = allocator.allocSentinel(u8, r.name.len, 0) catch {
+            freePartialCResults(c_results, i);
+            searcher.freeResults(results);
+            return null;
+        };
+        @memcpy(name_copy, r.name);
+
+        const c_snippets = allocator.alloc(HoundContextSnippet, r.snippets.len) catch {
+            allocator.free(name_copy);
+            freePartialCResults(c_results, i);
+            searcher.freeResults(results);
+            return null;
+        };
+
+        for (r.snippets, 0..) |snippet, si| {
+            const line_copy = allocator.allocSentinel(u8, snippet.line_content.len, 0) catch {
+                for (0..si) |sj| {
+                    allocator.free(std.mem.span(c_snippets[sj].line_content));
+                    if (c_snippets[sj].match_count > 0) allocator.free(c_snippets[sj].matches[0..c_snippets[sj].match_count]);
+                }
+                allocator.free(c_snippets);
+                allocator.free(name_copy);
+                freePartialCResults(c_results, i);
+                searcher.freeResults(results);
+                return null;
+            };
+            @memcpy(line_copy, snippet.line_content);
+
+            const c_matches = allocator.alloc(HoundMatchPosition, snippet.matches.len) catch {
+                allocator.free(line_copy);
+                for (0..si) |sj| {
+                    allocator.free(std.mem.span(c_snippets[sj].line_content));
+                    if (c_snippets[sj].match_count > 0) allocator.free(c_snippets[sj].matches[0..c_snippets[sj].match_count]);
+                }
+                allocator.free(c_snippets);
+                allocator.free(name_copy);
+                freePartialCResults(c_results, i);
+                searcher.freeResults(results);
+                return null;
+            };
+
+            for (snippet.matches, 0..) |m, mi| {
+                c_matches[mi] = .{ .start = m.start, .end = m.end };
+            }
+
+            c_snippets[si] = .{
+                .line_number = snippet.line_number,
+                .byte_offset = snippet.byte_offset,
+                .line_content = line_copy.ptr,
+                .line_content_len = snippet.line_content.len,
+                .matches = c_matches.ptr,
+                .match_count = snippet.matches.len,
+            };
+        }
+
+        c_results[i] = .{
+            .file_id = r.file_id,
+            .match_count = r.match_count,
+            .name = name_copy.ptr,
+            .name_len = r.name.len,
+            .snippets = c_snippets.ptr,
+            .snippet_count = r.snippets.len,
+            .score = r.score,
+        };
+    }
+
+    searcher.freeResults(results);
+
+    const output = allocator.create(HoundSearchResults) catch {
+        freePartialCResults(c_results, c_results.len);
+        return null;
+    };
+    output.* = .{ .results = c_results.ptr, .count = c_results.len };
+    return output;
+}
+
+// ============================================================================
 // Version API
 // ============================================================================
 
 pub export fn hound_version() [*:0]const u8 {
-    return "0.1.0";
+    return "0.2.1";
 }
